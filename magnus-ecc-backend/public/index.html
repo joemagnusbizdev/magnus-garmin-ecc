@@ -1,0 +1,1678 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>MAGNUS – Emergency Control Center</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+
+  <!-- Leaflet -->
+  <link
+    rel="stylesheet"
+    href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+  />
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+
+  <!-- Google Font close to Futura PT -->
+  <link
+    href="https://fonts.googleapis.com/css2?family=Rubik:wght@300;400;500;600;700&display=swap"
+    rel="stylesheet"
+  />
+
+  <style>
+    :root {
+      --bg-main: #f5f7f9;
+      --bg-card: #ffffff;
+      --bg-header: #2a2e33;
+      --bg-sidebar: #2a2e33;
+      --bg-pill-open: #e2e7ec;
+      --bg-pill-sos: #fedfdf;
+      --text-main: #2a2e33;
+      --text-muted: #808b94;
+      --accent-teal: #43c9b2;
+      --accent-red: #f86161;
+      --blue-gray-1: #474f59;
+      --border-soft: #e2e7ec;
+      --shadow-soft: 0 4px 12px rgba(0, 0, 0, 0.06);
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      font-family: "Rubik", system-ui, -apple-system, BlinkMacSystemFont,
+        "Segoe UI", sans-serif;
+      background: var(--bg-main);
+      color: var(--text-main);
+      height: 100vh;
+      display: flex;
+      flex-direction: column;
+    }
+
+    /* Top header */
+    header {
+      height: 56px;
+      background: var(--bg-header);
+      color: #ffffff;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 0 16px;
+      box-shadow: 0 2px 6px rgba(0, 0, 0, 0.3);
+    }
+
+    .header-left {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+
+    .logo-circle {
+      width: 32px;
+      height: 32px;
+      border-radius: 50%;
+      background: var(--accent-teal);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-weight: 700;
+      font-size: 18px;
+      color: #2a2e33;
+    }
+
+    .header-title {
+      display: flex;
+      flex-direction: column;
+    }
+
+    .header-title span:first-child {
+      font-size: 14px;
+      font-weight: 600;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+    }
+
+    .header-title span:last-child {
+      font-size: 12px;
+      color: #e2e7ec;
+    }
+
+    .header-right {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      font-size: 12px;
+    }
+
+    .header-env-input {
+      background: #1f2429;
+      border-radius: 4px;
+      border: 1px solid #4b5563;
+      padding: 4px 8px;
+      color: #e5e7eb;
+      min-width: 230px;
+      font-size: 11px;
+    }
+
+    .header-env-input:focus {
+      outline: none;
+      border-color: var(--accent-teal);
+    }
+
+    .sos-indicator {
+      font-size: 11px;
+      padding: 4px 8px;
+      border-radius: 999px;
+      border: 1px solid rgba(255, 255, 255, 0.15);
+      background: rgba(148, 163, 184, 0.4);
+      color: #e5e7eb;
+    }
+
+    /* Main layout */
+    main {
+      flex: 1;
+      display: grid;
+      grid-template-columns: 280px minmax(0, 1.3fr) minmax(0, 1.4fr);
+      min-height: 0;
+    }
+
+    /* LEFT COLUMN – INCIDENT / DEVICE LIST */
+    .sidebar {
+      background: var(--bg-sidebar);
+      color: #ffffff;
+      display: flex;
+      flex-direction: column;
+      border-right: 1px solid #181b20;
+    }
+
+    .sidebar-header {
+      padding: 10px 12px;
+      border-bottom: 1px solid #181b20;
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+
+    .sidebar-header-row {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      font-size: 11px;
+    }
+
+    .sidebar-search {
+      background: #181b20;
+      border-radius: 4px;
+      padding: 4px 6px;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+
+    .sidebar-search input {
+      flex: 1;
+      background: transparent;
+      border: none;
+      outline: none;
+      color: #e5e7eb;
+      font-size: 11px;
+    }
+
+    .sidebar-search input::placeholder {
+      color: #6b7280;
+    }
+
+    .sidebar-toggle {
+      display: flex;
+      align-items: center;
+      gap: 4px;
+      cursor: pointer;
+      font-size: 11px;
+    }
+
+    .toggle-pill {
+      width: 26px;
+      height: 14px;
+      border-radius: 999px;
+      border: 1px solid #6b7280;
+      background: #111827;
+      position: relative;
+    }
+
+    .toggle-thumb {
+      position: absolute;
+      top: 1px;
+      left: 1px;
+      width: 10px;
+      height: 10px;
+      border-radius: 50%;
+      background: #6b7280;
+      transition: transform 0.15s ease;
+    }
+
+    .toggle-pill.on {
+      border-color: var(--accent-teal);
+      background: #064e3b;
+    }
+
+    .toggle-pill.on .toggle-thumb {
+      transform: translateX(10px);
+      background: var(--accent-teal);
+    }
+
+    .sidebar-list {
+      flex: 1;
+      overflow-y: auto;
+      padding: 6px;
+    }
+
+    .incident-card {
+      background: #181b20;
+      border-radius: 8px;
+      padding: 8px 10px;
+      margin-bottom: 6px;
+      cursor: pointer;
+      border: 1px solid transparent;
+      transition: background 0.15s ease, border-color 0.15s ease;
+    }
+
+    .incident-card:hover {
+      background: #111827;
+    }
+
+    .incident-card.active {
+      border-color: var(--accent-teal);
+      box-shadow: 0 0 0 1px rgba(67, 201, 178, 0.3);
+    }
+
+    .incident-top {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      font-size: 12px;
+    }
+
+    .incident-name {
+      font-weight: 500;
+      color: #f9fafb;
+      max-width: 160px;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .incident-id {
+      font-size: 11px;
+      color: #9ca3af;
+    }
+
+    .incident-pill {
+      padding: 2px 6px;
+      border-radius: 999px;
+      font-size: 10px;
+      text-transform: uppercase;
+      font-weight: 600;
+    }
+
+    .pill-open {
+      background: var(--bg-pill-open);
+      color: var(--blue-gray-1);
+    }
+
+    .pill-sos {
+      background: var(--bg-pill-sos);
+      color: var(--accent-red);
+    }
+
+    .incident-meta {
+      display: flex;
+      justify-content: space-between;
+      margin-top: 4px;
+      font-size: 10px;
+      color: #9ca3af;
+    }
+
+    /* CENTER COLUMN – CHAT & TIMELINE */
+    .center-panel {
+      padding: 10px 12px;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+
+    .center-header {
+      background: var(--bg-card);
+      border-radius: 10px;
+      padding: 8px 10px;
+      border: 1px solid var(--border-soft);
+      box-shadow: var(--shadow-soft);
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      min-height: 56px;
+    }
+
+    .center-header-left {
+      display: flex;
+      flex-direction: column;
+    }
+
+    .center-title {
+      font-size: 13px;
+      font-weight: 500;
+    }
+
+    .center-subtitle {
+      font-size: 11px;
+      color: var(--text-muted);
+    }
+
+    .center-header-right {
+      font-size: 11px;
+      color: var(--text-muted);
+      display: flex;
+      flex-direction: column;
+      align-items: flex-end;
+    }
+
+    .center-sos-banner {
+      background: #332a2a;
+      color: #fedfdf;
+      border-radius: 8px;
+      padding: 6px 8px;
+      font-size: 11px;
+      display: none;
+      justify-content: space-between;
+      align-items: center;
+      gap: 8px;
+      border: 1px solid #594747;
+    }
+
+    .center-sos-banner.active {
+      display: flex;
+    }
+
+    .btn {
+      border-radius: 6px;
+      border: 1px solid transparent;
+      padding: 4px 8px;
+      font-size: 11px;
+      cursor: pointer;
+      font-family: inherit;
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      background: #e5e7eb;
+      color: #111827;
+    }
+
+    .btn-primary {
+      background: var(--accent-teal);
+      color: #0f172a;
+      border-color: var(--accent-teal);
+    }
+
+    .btn-danger {
+      background: var(--accent-red);
+      color: #fff7f7;
+      border-color: var(--accent-red);
+    }
+
+    .btn-ghost {
+      background: transparent;
+      border-color: #9ca3af;
+      color: #e5e7eb;
+    }
+
+    .btn:disabled {
+      opacity: 0.6;
+      cursor: default;
+    }
+
+    .chat-card {
+      flex: 1;
+      background: var(--bg-card);
+      border-radius: 10px;
+      padding: 8px 10px;
+      border: 1px solid var(--border-soft);
+      box-shadow: var(--shadow-soft);
+      display: flex;
+      flex-direction: column;
+      min-height: 0;
+    }
+
+    .chat-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 4px;
+      font-size: 11px;
+      color: var(--text-muted);
+    }
+
+    .chat-messages {
+      flex: 1;
+      overflow-y: auto;
+      padding: 4px 0;
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+    }
+
+    .chat-bubble {
+      max-width: 80%;
+      padding: 6px 8px;
+      border-radius: 8px;
+      display: inline-block;
+      font-size: 11px;
+      line-height: 1.3;
+      position: relative;
+      white-space: pre-wrap;
+    }
+
+    .chat-bubble.inbound {
+      align-self: flex-start;
+      background: #e5f3ff;
+      color: #111827;
+    }
+
+    .chat-bubble.outbound {
+      align-self: flex-end;
+      background: #ecfdf3;
+      color: #064e3b;
+    }
+
+    .chat-bubble-meta {
+      font-size: 9px;
+      color: var(--text-muted);
+      margin-bottom: 2px;
+      display: flex;
+      justify-content: space-between;
+      gap: 4px;
+    }
+
+    .chat-sos-tag {
+      font-size: 9px;
+      padding: 1px 4px;
+      border-radius: 999px;
+      background: var(--bg-pill-sos);
+      color: var(--accent-red);
+      text-transform: uppercase;
+      font-weight: 600;
+      margin-left: 4px;
+    }
+
+    .chat-input-area {
+      border-top: 1px solid #e5e7eb;
+      padding-top: 6px;
+      margin-top: 4px;
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+    }
+
+    .chat-input-row {
+      display: flex;
+      gap: 6px;
+    }
+
+    .chat-input {
+      flex: 1;
+      border-radius: 6px;
+      border: 1px solid #d1d5db;
+      padding: 6px 8px;
+      font-size: 12px;
+      font-family: inherit;
+      resize: vertical;
+      min-height: 40px;
+      max-height: 120px;
+    }
+
+    .chat-input:focus {
+      outline: none;
+      border-color: var(--accent-teal);
+    }
+
+    /* RIGHT COLUMN – MAP / TABS */
+    .right-panel {
+      padding: 10px 12px;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+
+    .tabs {
+      display: inline-flex;
+      background: #e2e7ec;
+      border-radius: 999px;
+      padding: 3px;
+      gap: 2px;
+      align-self: flex-start;
+    }
+
+    .tab {
+      font-size: 11px;
+      padding: 4px 10px;
+      border-radius: 999px;
+      cursor: pointer;
+      border: none;
+      background: transparent;
+      color: var(--blue-gray-1);
+    }
+
+    .tab.active {
+      background: #ffffff;
+      box-shadow: 0 1px 2px rgba(0, 0, 0, 0.08);
+      font-weight: 500;
+    }
+
+    .map-card {
+      background: var(--bg-card);
+      border-radius: 10px;
+      border: 1px solid var(--border-soft);
+      box-shadow: var(--shadow-soft);
+      padding: 8px;
+      display: flex;
+      flex-direction: column;
+      min-height: 0;
+      flex: 1;
+    }
+
+    #map {
+      width: 100%;
+      height: 260px;
+      border-radius: 8px;
+      overflow: hidden;
+    }
+
+    .map-controls {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-top: 6px;
+      font-size: 11px;
+    }
+
+    .map-controls-left {
+      display: flex;
+      gap: 6px;
+    }
+
+    .map-controls-right {
+      color: var(--text-muted);
+    }
+
+    .locations-list {
+      flex: 1;
+      overflow-y: auto;
+      margin-top: 6px;
+      border-top: 1px solid #e5e7eb;
+      padding-top: 4px;
+      font-size: 11px;
+    }
+
+    .location-row {
+      display: flex;
+      justify-content: space-between;
+      padding: 4px 2px;
+      cursor: pointer;
+      border-radius: 4px;
+    }
+
+    .location-row:hover {
+      background: #f3f4f6;
+    }
+
+    .device-info-list {
+      flex: 1;
+      overflow-y: auto;
+      margin-top: 6px;
+      border-top: 1px solid #e5e7eb;
+      padding-top: 4px;
+      font-size: 11px;
+    }
+
+    .info-row {
+      display: flex;
+      justify-content: space-between;
+      padding: 3px 2px;
+    }
+
+    .info-key {
+      color: var(--text-muted);
+    }
+
+    .info-value {
+      font-weight: 500;
+    }
+
+    .muted {
+      color: var(--text-muted);
+    }
+
+    .status-dot {
+      display: inline-block;
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      margin-right: 4px;
+    }
+
+    .status-online {
+      background: #22c55e;
+    }
+
+    .status-offline {
+      background: #9ca3af;
+    }
+
+    .status-sos {
+      background: var(--accent-red);
+    }
+  </style>
+</head>
+
+<body>
+  <header>
+    <div class="header-left">
+      <div class="logo-circle">M</div>
+      <div class="header-title">
+        <span>Emergency Control Center</span>
+        <span>MAGNUS · Garmin inReach Console</span>
+      </div>
+    </div>
+    <div class="header-right">
+      <button class="btn btn-ghost" id="btn-logout" style="font-size:11px;">
+        Logout
+      </button>
+      <div class="sos-indicator" id="global-sos-indicator">
+        No active SOS
+      </div>
+      <div>
+        <div style="font-size: 10px; color: #9ca3af;">API Base</div>
+        <input
+          id="api-base-input"
+          class="header-env-input"
+          type="text"
+        />
+      </div>
+    </div>
+  </header>
+
+  <main>
+    <!-- LEFT: INCIDENTS / DEVICES -->
+    <aside class="sidebar">
+      <div class="sidebar-header">
+        <div class="sidebar-header-row">
+          <span style="font-size: 12px; font-weight: 500;">Emergencies</span>
+          <span style="font-size: 11px; color: #9ca3af;" id="incident-count">
+            0 devices
+          </span>
+        </div>
+        <div class="sidebar-search">
+          <span style="font-size: 12px; color: #6b7280;">🔍</span>
+          <input
+            id="search-input"
+            type="text"
+            placeholder="Search by name or IMEI"
+          />
+        </div>
+        <div class="sidebar-header-row">
+          <div
+            class="sidebar-toggle"
+            id="toggle-open-only"
+          >
+            <div class="toggle-pill" id="toggle-pill">
+              <div class="toggle-thumb"></div>
+            </div>
+            <span>Open only</span>
+          </div>
+          <span class="muted" id="last-refresh-label">–</span>
+        </div>
+      </div>
+      <div class="sidebar-list" id="incident-list">
+        <!-- populated by JS -->
+      </div>
+    </aside>
+
+    <!-- CENTER: CHAT / TIMELINE -->
+    <section class="center-panel">
+      <div class="center-header">
+        <div class="center-header-left">
+          <div class="center-title" id="center-title">
+            No device selected
+          </div>
+          <div class="center-subtitle" id="center-subtitle">
+            Select a device from the left panel to view SOS timeline and
+            messages.
+          </div>
+        </div>
+        <div class="center-header-right" id="center-header-right">
+          <div id="center-header-status">–</div>
+          <button
+            class="btn btn-ghost"
+            id="btn-close-incident"
+            style="margin-top:4px;"
+          >
+            Close incident
+          </button>
+        </div>
+      </div>
+
+      <div
+        class="center-sos-banner"
+        id="sos-banner"
+      >
+        <div>
+          <strong>Active SOS</strong>
+          <span id="sos-banner-text" class="muted">
+            Awaiting acknowledgement…
+          </span>
+        </div>
+        <div>
+          <button
+            class="btn btn-danger"
+            id="btn-sos-ack"
+          >
+            Acknowledge
+          </button>
+        </div>
+      </div>
+
+      <div class="chat-card">
+        <div class="chat-header">
+          <span>Message history</span>
+          <span id="chat-meta" class="muted">–</span>
+        </div>
+        <div
+          class="chat-messages"
+          id="chat-messages"
+        >
+          <!-- bubbles -->
+        </div>
+        <div class="chat-input-area">
+          <div class="chat-input-row">
+            <textarea
+              id="chat-input"
+              class="chat-input"
+              placeholder="Type a message to the device…"
+            ></textarea>
+          </div>
+          <div class="chat-input-row" style="justify-content: space-between;">
+            <div style="font-size: 10px; color: var(--text-muted);">
+              Messages are sent via Garmin inReach messaging.
+            </div>
+            <div style="display:flex; gap:6px;">
+              <button
+                class="btn btn-ghost"
+                id="btn-send-sos-message"
+              >
+                Send as SOS message
+              </button>
+              <button
+                class="btn btn-primary"
+                id="btn-send-message"
+              >
+                Send
+              </button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- RIGHT: MAP / USER LOCATIONS / DEVICE INFO -->
+    <aside class="right-panel">
+      <div class="tabs">
+        <button class="tab active" data-tab="map">Map View</button>
+        <button class="tab" data-tab="locations">User Locations</button>
+        <button class="tab" data-tab="info">Device Info</button>
+      </div>
+
+      <div class="map-card">
+        <!-- MAP TAB -->
+        <div
+          class="tab-panel"
+          id="tab-map"
+        >
+          <div id="map"></div>
+          <div class="map-controls">
+            <div class="map-controls-left">
+              <button
+                class="btn btn-ghost"
+                id="btn-locate"
+              >
+                Request location
+              </button>
+              <button
+                class="btn btn-ghost"
+                id="btn-tracking-toggle"
+              >
+                Toggle tracking
+              </button>
+            </div>
+            <div class="map-controls-right">
+              <span id="map-status" class="muted">No device selected</span>
+            </div>
+          </div>
+        </div>
+
+        <!-- LOCATIONS TAB -->
+        <div
+          class="tab-panel"
+          id="tab-locations"
+          style="display:none;"
+        >
+          <div style="font-size:11px; margin-bottom:4px;">
+            Recent locations (click to center on map)
+          </div>
+          <div
+            class="locations-list"
+            id="locations-list"
+          >
+            <!-- rows -->
+          </div>
+        </div>
+
+        <!-- DEVICE INFO TAB -->
+        <div
+          class="tab-panel"
+          id="tab-info"
+          style="display:none;"
+        >
+          <div style="font-size:11px; margin-bottom:4px;">
+            Device status (last known)
+          </div>
+          <div
+            class="device-info-list"
+            id="device-info-list"
+          >
+            <!-- rows -->
+          </div>
+        </div>
+      </div>
+    </aside>
+  </main>
+
+  <script>
+    // ===== CONFIG =====
+    // Default API base to same origin (localhost or tunnel)
+    let API_BASE = window.location.origin.replace(/\/+$/, "");
+
+    // DOM refs
+    const apiBaseInput = document.getElementById("api-base-input");
+    const globalSosIndicator = document.getElementById("global-sos-indicator");
+    const incidentListEl = document.getElementById("incident-list");
+    const incidentCountEl = document.getElementById("incident-count");
+    const searchInputEl = document.getElementById("search-input");
+    const toggleOpenOnlyEl = document.getElementById("toggle-open-only");
+    const togglePillEl = document.getElementById("toggle-pill");
+    const lastRefreshLabelEl = document.getElementById("last-refresh-label");
+    const btnLogout = document.getElementById("btn-logout");
+
+    const centerTitleEl = document.getElementById("center-title");
+    const centerSubtitleEl = document.getElementById("center-subtitle");
+    const centerHeaderStatusEl = document.getElementById("center-header-status");
+    const btnCloseIncident = document.getElementById("btn-close-incident");
+
+    const sosBannerEl = document.getElementById("sos-banner");
+    const sosBannerTextEl = document.getElementById("sos-banner-text");
+    const btnSosAck = document.getElementById("btn-sos-ack");
+
+    const chatMessagesEl = document.getElementById("chat-messages");
+    const chatInputEl = document.getElementById("chat-input");
+    const chatMetaEl = document.getElementById("chat-meta");
+    const btnSendMessage = document.getElementById("btn-send-message");
+    const btnSendSosMessage = document.getElementById("btn-send-sos-message");
+
+    const btnLocate = document.getElementById("btn-locate");
+    const btnTrackingToggle = document.getElementById("btn-tracking-toggle");
+    const mapStatusEl = document.getElementById("map-status");
+
+    const tabs = document.querySelectorAll(".tab");
+    const tabMapEl = document.getElementById("tab-map");
+    const tabLocationsEl = document.getElementById("tab-locations");
+    const tabInfoEl = document.getElementById("tab-info");
+    const locationsListEl = document.getElementById("locations-list");
+    const deviceInfoListEl = document.getElementById("device-info-list");
+
+    // init API base input
+    apiBaseInput.value = API_BASE;
+    apiBaseInput.addEventListener("change", () => {
+      API_BASE = apiBaseInput.value.trim().replace(/\/+$/, "");
+      loadDevices();
+    });
+
+    // Logout best-effort (Basic Auth)
+    btnLogout.addEventListener("click", () => {
+      fetch("/logout", { cache: "no-store" }).finally(() => {
+        window.location.href = "/console";
+      });
+    });
+
+    // ===== SIMPLE HTTP HELPERS =====
+    function httpGet(path) {
+      return fetch(`${API_BASE}${path}`).then((res) => {
+        if (!res.ok) {
+          throw new Error(`GET ${path} failed: ${res.status}`);
+        }
+        return res.json();
+      });
+    }
+
+    function httpPost(path, body) {
+      return fetch(`${API_BASE}${path}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: body ? JSON.stringify(body) : "{}",
+      }).then((res) => {
+        if (!res.ok) {
+          return res.text().then((txt) => {
+            throw new Error(`POST ${path} failed: ${res.status} ${txt}`);
+          });
+        }
+        return res.json();
+      });
+    }
+
+    // ===== GLOBAL STATE =====
+    let devices = [];
+    let filteredDevices = [];
+    let selectedImei = null;
+    let openOnly = false;
+
+    let map;
+    let markers = {};
+    let trackLayer = null;
+
+    // ===== MAP INIT =====
+    function initMap() {
+      map = L.map("map").setView([32.0853, 34.7818], 6);
+      L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
+        maxZoom: 18,
+      }).addTo(map);
+    }
+
+    // ===== UTILITIES =====
+    function fmtTime(iso) {
+      if (!iso) return "–";
+      const d = new Date(iso);
+      if (isNaN(d)) return "–";
+      return d.toLocaleString();
+    }
+
+    function timeAgo(iso) {
+      if (!iso) return "never";
+      const d = new Date(iso);
+      if (isNaN(d)) return "never";
+      const diffMs = Date.now() - d.getTime();
+      const diffMin = Math.round(diffMs / 60000);
+      if (diffMin < 1) return "just now";
+      if (diffMin < 60) return `${diffMin} min ago`;
+      const diffHr = Math.round(diffMin / 60);
+      if (diffHr < 24) return `${diffHr} h ago`;
+      const diffDay = Math.round(diffHr / 24);
+      return `${diffDay} d ago`;
+    }
+
+    function lastActivity(device) {
+      const ts =
+        device.position?.timestamp ||
+        device.lastMessage?.timestamp ||
+        null;
+      return ts;
+    }
+
+    function setButtonLoading(btn, loading) {
+      if (!btn) return;
+      if (loading) {
+        btn.disabled = true;
+        if (!btn.dataset._label) {
+          btn.dataset._label = btn.textContent;
+        }
+        btn.textContent = "Working…";
+      } else {
+        btn.disabled = false;
+        if (btn.dataset._label) {
+          btn.textContent = btn.dataset._label;
+        }
+      }
+    }
+
+    // ===== DEVICE LIST RENDERING =====
+    function applyFilters() {
+      const q = searchInputEl.value.trim().toLowerCase();
+      filteredDevices = devices.filter((d) => {
+        // hide closed incidents when "Open only" is on
+        if (openOnly && d.status === "closed") {
+          return false;
+        }
+        if (!q) return true;
+        const name = (d.label || "").toLowerCase();
+        const imei = (d.imei || "").toLowerCase();
+        return name.includes(q) || imei.includes(q);
+      });
+    }
+
+    function renderDevicesList() {
+      incidentListEl.innerHTML = "";
+      const activeCount = devices.filter((d) => d.isActiveSos).length;
+      if (activeCount > 0) {
+        globalSosIndicator.textContent = `${activeCount} active SOS`;
+        globalSosIndicator.style.background = "rgba(248,97,97,0.28)";
+        globalSosIndicator.style.color = "#fff5f5";
+      } else {
+        globalSosIndicator.textContent = "No active SOS";
+        globalSosIndicator.style.background = "rgba(148,163,184,0.4)";
+        globalSosIndicator.style.color = "#e5e7eb";
+      }
+
+      incidentCountEl.textContent = `${filteredDevices.length} devices`;
+
+      filteredDevices.forEach((d) => {
+        const card = document.createElement("div");
+        card.className = "incident-card";
+        if (d.imei === selectedImei) card.classList.add("active");
+        card.dataset.imei = d.imei;
+
+        const top = document.createElement("div");
+        top.className = "incident-top";
+
+        const name = document.createElement("div");
+        name.className = "incident-name";
+        name.textContent = d.label || "Unknown user";
+
+        const pill = document.createElement("div");
+
+        // Open / Closed / SOS pill
+        if (d.isActiveSos) {
+          pill.className = "incident-pill pill-sos";
+          pill.textContent = "SOS";
+        } else if (d.status === "closed") {
+          pill.className = "incident-pill pill-open";
+          pill.textContent = "Closed";
+        } else {
+          pill.className = "incident-pill pill-open";
+          pill.textContent = "Open";
+        }
+
+        top.appendChild(name);
+        top.appendChild(pill);
+
+        const mid = document.createElement("div");
+        mid.className = "incident-id";
+        mid.textContent = `ID: ${d.imei}`;
+
+        const meta = document.createElement("div");
+        meta.className = "incident-meta";
+        const lastTs = lastActivity(d);
+        meta.innerHTML = `
+          <span>${timeAgo(lastTs)}</span>
+          <span>${
+            d.position && d.position.gpsFix ? "GPS fix" : "No fix"
+          }</span>
+        `;
+
+        card.appendChild(top);
+        card.appendChild(mid);
+        card.appendChild(meta);
+
+        card.addEventListener("click", () => {
+          selectDevice(d.imei);
+        });
+
+        incidentListEl.appendChild(card);
+      });
+    }
+
+    // ===== MAP MARKERS =====
+    function updateMarkers() {
+      // remove markers for devices that no longer exist
+      Object.keys(markers).forEach((imei) => {
+        if (!devices.find((d) => d.imei === imei)) {
+          map.removeLayer(markers[imei]);
+          delete markers[imei];
+        }
+      });
+
+      devices.forEach((d) => {
+        const pos = d.position;
+        if (!pos || pos.lat == null || pos.lng == null) return;
+        const isSos = !!d.isActiveSos;
+
+        const icon = L.divIcon({
+          html: `
+            <div style="
+              width: 16px;
+              height: 16px;
+              border-radius: 999px;
+              border: 2px solid #ffffff;
+              box-shadow: 0 0 0 1px rgba(0,0,0,0.15);
+              background: ${isSos ? "#F86161" : "#43C9B2"};
+            "></div>
+          `,
+          className: "",
+          iconSize: [16, 16],
+          iconAnchor: [8, 8],
+        });
+
+        if (!markers[d.imei]) {
+          const m = L.marker([pos.lat, pos.lng], { icon }).addTo(map);
+          m.on("click", () => selectDevice(d.imei));
+          markers[d.imei] = m;
+        } else {
+          markers[d.imei].setLatLng([pos.lat, pos.lng]);
+          markers[d.imei].setIcon(icon);
+        }
+      });
+    }
+
+    function drawTrack(imei) {
+      if (trackLayer) {
+        map.removeLayer(trackLayer);
+        trackLayer = null;
+      }
+      httpGet(
+        `/api/garmin/devices/${encodeURIComponent(imei)}/positions`
+      )
+        .then((points) => {
+          if (!points || points.length === 0) {
+            locationsListEl.textContent = "No locations yet.";
+            return;
+          }
+          const latlngs = points.map((p) => [p.lat, p.lng]);
+          trackLayer = L.polyline(latlngs, { weight: 3 }).addTo(map);
+          map.fitBounds(trackLayer.getBounds(), { padding: [40, 40] });
+          renderLocationsList(points);
+        })
+        .catch((err) => {
+          console.error("Error loading positions:", err);
+        });
+    }
+
+    function renderLocationsList(points) {
+      locationsListEl.innerHTML = "";
+      if (!points || points.length === 0) {
+        locationsListEl.textContent = "No locations yet.";
+        return;
+      }
+      points.slice(0, 100).forEach((p) => {
+        const row = document.createElement("div");
+        row.className = "location-row";
+        row.innerHTML = `
+          <span>${p.lat.toFixed(5)}, ${p.lng.toFixed(5)}</span>
+          <span class="muted">${timeAgo(p.timestamp)}</span>
+        `;
+        row.addEventListener("click", () => {
+          if (map) {
+            map.setView([p.lat, p.lng], 12);
+          }
+        });
+        locationsListEl.appendChild(row);
+      });
+    }
+
+    // ===== DEVICE DETAIL / CHAT / SOS =====
+    function renderDeviceHeader(device, detail) {
+      if (!device) {
+        centerTitleEl.textContent = "No device selected";
+        centerSubtitleEl.textContent =
+          "Select a device from the left panel to view SOS timeline and messages.";
+        centerHeaderStatusEl.textContent = "–";
+        btnCloseIncident.disabled = true;
+        return;
+      }
+
+      centerTitleEl.textContent = device.label || `Device ${device.imei}`;
+
+      if (device.status === "closed") {
+        centerSubtitleEl.textContent = `IMEI: ${
+          device.imei
+        } · Status: Closed${
+          device.closedAt ? " · " + fmtTime(device.closedAt) : ""
+        }`;
+        btnCloseIncident.disabled = true;
+      } else {
+        centerSubtitleEl.textContent = `IMEI: ${
+          device.imei
+        } · Status: Open · Last activity: ${timeAgo(lastActivity(device))}`;
+        btnCloseIncident.disabled = false;
+      }
+
+      const pos = detail?.position;
+      if (pos && pos.lat != null && pos.lng != null) {
+        centerHeaderStatusEl.innerHTML = `
+          <span class="status-dot ${
+            device.isActiveSos
+              ? "status-sos"
+              : pos.gpsFix
+              ? "status-online"
+              : "status-offline"
+          }"></span>
+          ${pos.lat.toFixed(4)}, ${pos.lng.toFixed(
+          4
+        )} · ${fmtTime(pos.timestamp)}
+        `;
+      } else {
+        centerHeaderStatusEl.innerHTML = `
+          <span class="status-dot ${
+            device.isActiveSos ? "status-sos" : "status-offline"
+          }"></span>
+          No recent position
+        `;
+      }
+    }
+
+    function renderChat(messages) {
+      chatMessagesEl.innerHTML = "";
+      if (!messages || messages.length === 0) {
+        chatMessagesEl.textContent = "No messages yet.";
+        chatMetaEl.textContent = "0 messages";
+        return;
+      }
+      chatMetaEl.textContent = `${messages.length} messages`;
+
+      messages
+        .slice()
+        .reverse()
+        .forEach((m) => {
+          const wrap = document.createElement("div");
+          const bubble = document.createElement("div");
+          const meta = document.createElement("div");
+
+          bubble.className =
+            "chat-bubble " +
+            (m.direction === "inbound" ? "inbound" : "outbound");
+          meta.className = "chat-bubble-meta";
+
+          const left = document.createElement("span");
+          left.textContent =
+            m.direction === "inbound"
+              ? "From device"
+              : "To device";
+
+          if (m.isSos) {
+            const tag = document.createElement("span");
+            tag.className = "chat-sos-tag";
+            tag.textContent = "SOS";
+            left.appendChild(tag);
+          }
+
+          const right = document.createElement("span");
+          right.textContent = fmtTime(m.timestamp);
+
+          meta.appendChild(left);
+          meta.appendChild(right);
+
+          bubble.textContent = m.text || "";
+
+          wrap.appendChild(meta);
+          wrap.appendChild(bubble);
+
+          chatMessagesEl.appendChild(wrap);
+        });
+
+      chatMessagesEl.scrollTop = chatMessagesEl.scrollHeight;
+    }
+
+    function renderSosState(state, device) {
+      if (!state || !device) {
+        sosBannerEl.classList.remove("active");
+        btnSosAck.disabled = true;
+        return;
+      }
+      if (state.isActiveSos) {
+        sosBannerEl.classList.add("active");
+        sosBannerTextEl.textContent = `SOS active since ${fmtTime(
+          state.lastSosEventAt
+        )}`;
+        btnSosAck.disabled = false;
+      } else {
+        sosBannerEl.classList.remove("active");
+        btnSosAck.disabled = true;
+      }
+    }
+
+    function renderDeviceInfo(detail) {
+      deviceInfoListEl.innerHTML = "";
+      if (!detail) {
+        deviceInfoListEl.textContent = "No device selected.";
+        return;
+      }
+      const rows = [];
+
+      rows.push({
+        key: "IMEI",
+        value: detail.imei,
+      });
+      rows.push({
+        key: "Tracking enabled",
+        value:
+          detail.trackingEnabled === 1 ||
+          detail.trackingEnabled === true
+            ? "Yes"
+            : "No",
+      });
+      if (detail.trackingInterval) {
+        rows.push({
+          key: "Tracking interval (sec)",
+          value: detail.trackingInterval,
+        });
+      }
+      if (detail.lastSosEventAt) {
+        rows.push({
+          key: "Last SOS event",
+          value: fmtTime(detail.lastSosEventAt),
+        });
+      }
+      if (detail.lastSosAckAt) {
+        rows.push({
+          key: "Last SOS ack",
+          value: fmtTime(detail.lastSosAckAt),
+        });
+      }
+
+      if (detail.status) {
+        Object.keys(detail.status).forEach((k) => {
+          const v = detail.status[k];
+          rows.push({
+            key: k,
+            value:
+              typeof v === "object" ? JSON.stringify(v) : String(v),
+          });
+        });
+      }
+
+      if (rows.length === 0) {
+        deviceInfoListEl.textContent = "No status information.";
+        return;
+      }
+
+      rows.forEach((r) => {
+        const row = document.createElement("div");
+        row.className = "info-row";
+        row.innerHTML = `
+          <span class="info-key">${r.key}</span>
+          <span class="info-value">${r.value}</span>
+        `;
+        deviceInfoListEl.appendChild(row);
+      });
+    }
+
+    // ===== SELECT DEVICE =====
+    function selectDevice(imei) {
+      selectedImei = imei;
+      document
+        .querySelectorAll(".incident-card")
+        .forEach((el) =>
+          el.classList.toggle("active", el.dataset.imei === imei)
+        );
+
+      Promise.all([
+        httpGet(`/api/garmin/devices/${encodeURIComponent(imei)}`),
+        httpGet(
+          `/api/garmin/devices/${encodeURIComponent(
+            imei
+          )}/messages?limit=50`
+        ),
+        httpGet(
+          `/api/garmin/devices/${encodeURIComponent(
+            imei
+          )}/sos/state`
+        ),
+      ])
+        .then(([detail, messages, sosState]) => {
+          const device = devices.find((d) => d.imei === imei);
+          renderDeviceHeader(device, detail);
+          renderChat(messages);
+          renderSosState(sosState, device);
+          renderDeviceInfo(detail);
+          drawTrack(imei);
+
+          if (detail.position && detail.position.lat != null) {
+            mapStatusEl.textContent = `Last position: ${fmtTime(
+              detail.position.timestamp
+            )}`;
+            map.setView(
+              [detail.position.lat, detail.position.lng],
+              9
+            );
+          } else {
+            mapStatusEl.textContent = "No recent position.";
+          }
+        })
+        .catch((err) => {
+          console.error("Error loading device detail:", err);
+        });
+    }
+
+    // ===== ACTION BUTTONS =====
+    btnSendMessage.addEventListener("click", () => {
+      if (!selectedImei) {
+        alert("Select a device first.");
+        return;
+      }
+      const text = chatInputEl.value.trim();
+      if (!text) {
+        alert("Enter a message.");
+        return;
+      }
+      setButtonLoading(btnSendMessage, true);
+      httpPost(
+        `/api/garmin/devices/${encodeURIComponent(
+          selectedImei
+        )}/message`,
+        { text }
+      )
+        .then(() => {
+          chatInputEl.value = "";
+          return httpGet(
+            `/api/garmin/devices/${encodeURIComponent(
+              selectedImei
+            )}/messages?limit=50`
+          );
+        })
+        .then(renderChat)
+        .catch((err) => {
+          console.error("Send message error:", err);
+          alert("Failed to send message.");
+        })
+        .finally(() => setButtonLoading(btnSendMessage, false));
+    });
+
+    btnSendSosMessage.addEventListener("click", () => {
+      if (!selectedImei) {
+        alert("Select a device first.");
+        return;
+      }
+      const text = chatInputEl.value.trim();
+      if (!text) {
+        alert("Enter a message.");
+        return;
+      }
+      setButtonLoading(btnSendSosMessage, true);
+      httpPost(
+        `/api/garmin/devices/${encodeURIComponent(
+          selectedImei
+        )}/sos/message`,
+        { text }
+      )
+        .then(() => {
+          chatInputEl.value = "";
+          return httpGet(
+            `/api/garmin/devices/${encodeURIComponent(
+              selectedImei
+            )}/messages?limit=50`
+          );
+        })
+        .then(renderChat)
+        .catch((err) => {
+          console.error("Send SOS message error:", err);
+          alert("Failed to send SOS message.");
+        })
+        .finally(() =>
+          setButtonLoading(btnSendSosMessage, false)
+        );
+    });
+
+    btnSosAck.addEventListener("click", () => {
+      if (!selectedImei) {
+        alert("Select a device first.");
+        return;
+      }
+      setButtonLoading(btnSosAck, true);
+      httpPost(
+        `/api/garmin/devices/${encodeURIComponent(
+          selectedImei
+        )}/sos/ack`
+      )
+        .then(() =>
+          httpGet(
+            `/api/garmin/devices/${encodeURIComponent(
+              selectedImei
+            )}/sos/state`
+          )
+        )
+        .then((state) => {
+          const device = devices.find(
+            (d) => d.imei === selectedImei
+          );
+          renderSosState(state, device);
+        })
+        .catch((err) => {
+          console.error("SOS ack error:", err);
+          alert("Failed to acknowledge SOS.");
+        })
+        .finally(() => setButtonLoading(btnSosAck, false));
+    });
+
+    btnLocate.addEventListener("click", () => {
+      if (!selectedImei) {
+        alert("Select a device first.");
+        return;
+      }
+      setButtonLoading(btnLocate, true);
+      httpPost(
+        `/api/garmin/devices/${encodeURIComponent(
+          selectedImei
+        )}/locate`
+      )
+        .then(() => {
+          alert(
+            "Location request sent. A new position should arrive via Garmin."
+          );
+        })
+        .catch((err) => {
+          console.error("Locate error:", err);
+          alert("Failed to send locate request.");
+        })
+        .finally(() => setButtonLoading(btnLocate, false));
+    });
+
+    btnTrackingToggle.addEventListener("click", () => {
+      if (!selectedImei) {
+        alert("Select a device first.");
+        return;
+      }
+      httpGet(
+        `/api/garmin/devices/${encodeURIComponent(selectedImei)}`
+      )
+        .then((detail) => {
+          const enabled =
+            detail.trackingEnabled === 1 ||
+            detail.trackingEnabled === true;
+          const path = enabled
+            ? `/api/garmin/devices/${encodeURIComponent(
+                selectedImei
+              )}/tracking/stop`
+            : `/api/garmin/devices/${encodeURIComponent(
+                selectedImei
+              )}/tracking/start`;
+          setButtonLoading(btnTrackingToggle, true);
+          return httpPost(path, {});
+        })
+        .then(() =>
+          httpGet(
+            `/api/garmin/devices/${encodeURIComponent(
+              selectedImei
+            )}`
+          )
+        )
+        .then((detail) => {
+          const device = devices.find(
+            (d) => d.imei === selectedImei
+          );
+          renderDeviceInfo(detail);
+          renderDeviceHeader(device, detail);
+        })
+        .catch((err) => {
+          console.error("Tracking toggle error:", err);
+          alert("Failed to toggle tracking.");
+        })
+        .finally(() =>
+          setButtonLoading(btnTrackingToggle, false)
+        );
+    });
+
+    // Close incident
+    btnCloseIncident.addEventListener("click", () => {
+      if (!selectedImei) {
+        alert("Select a device first.");
+        return;
+      }
+      if (!confirm("Are you sure you want to close this incident?")) return;
+
+      setButtonLoading(btnCloseIncident, true);
+
+      httpPost(
+        `/api/garmin/devices/${encodeURIComponent(
+          selectedImei
+        )}/close`
+      )
+        .then(() => {
+          return Promise.all([
+            (loadDevices(), true),
+            httpGet(
+              `/api/garmin/devices/${encodeURIComponent(
+                selectedImei
+              )}`
+            ),
+          ]);
+        })
+        .then(([_, detail]) => {
+          const device = devices.find(
+            (d) => d.imei === selectedImei
+          );
+          renderDeviceHeader(device, detail);
+          alert("Incident closed.");
+        })
+        .catch((err) => {
+          console.error("Close incident error:", err);
+          alert("Failed to close incident.");
+        })
+        .finally(() =>
+          setButtonLoading(btnCloseIncident, false)
+        );
+    });
+
+    // ===== TABS =====
+    tabs.forEach((tab) => {
+      tab.addEventListener("click", () => {
+        tabs.forEach((t) => t.classList.remove("active"));
+        tab.classList.add("active");
+        const which = tab.dataset.tab;
+        tabMapEl.style.display =
+          which === "map" ? "" : "none";
+        tabLocationsEl.style.display =
+          which === "locations" ? "" : "none";
+        tabInfoEl.style.display =
+          which === "info" ? "" : "none";
+      });
+    });
+
+    // ===== FILTERS =====
+    searchInputEl.addEventListener("input", () => {
+      applyFilters();
+      renderDevicesList();
+    });
+
+    toggleOpenOnlyEl.addEventListener("click", () => {
+      openOnly = !openOnly;
+      togglePillEl.classList.toggle("on", openOnly);
+      applyFilters();
+      renderDevicesList();
+    });
+
+    // ===== LOAD DEVICES + POLLING =====
+    function loadDevices() {
+      httpGet("/api/garmin/devices")
+        .then((list) => {
+          devices = list || [];
+          applyFilters();
+          renderDevicesList();
+          updateMarkers();
+          const now = new Date();
+          lastRefreshLabelEl.textContent =
+            "Updated " + now.toLocaleTimeString();
+
+          if (
+            !selectedImei &&
+            devices.length > 0
+          ) {
+            selectDevice(devices[0].imei);
+          }
+        })
+        .catch((err) => {
+          console.error("Error loading devices:", err);
+          lastRefreshLabelEl.textContent = "Failed to refresh";
+        });
+    }
+
+    // ===== INIT =====
+    initMap();
+    loadDevices();
+    setInterval(loadDevices, 30000); // 30s polling
+  </script>
+</body>
+</html>
