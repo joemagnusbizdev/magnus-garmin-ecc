@@ -1,6 +1,78 @@
 // --------------------------------------------
 //  MAGNUS GARMIN ECC BACKEND (Node + SQLite)
 // --------------------------------------------
+console.log("STEP 1: Starting server.js");
+
+require("dotenv").config();
+console.log("STEP 2: dotenv loaded");
+
+let express, morgan, Database, pathModule, axios, corsLib;
+
+// Load modules one by one so we see where it dies
+try {
+  express = require("express");
+  console.log("STEP 3: express loaded");
+} catch (err) {
+  console.error("ERROR loading express:", err);
+  process.exit(1);
+}
+
+try {
+  morgan = require("morgan");
+  console.log("STEP 4: morgan loaded");
+} catch (err) {
+  console.error("ERROR loading morgan:", err);
+  process.exit(1);
+}
+
+try {
+  Database = require("better-sqlite3");
+  console.log("STEP 5: better-sqlite3 loaded");
+} catch (err) {
+  console.error("ERROR loading better-sqlite3:", err);
+  process.exit(1);
+}
+
+try {
+  pathModule = require("path");
+  console.log("STEP 6: path loaded");
+} catch (err) {
+  console.error("ERROR loading path:", err);
+  process.exit(1);
+}
+
+try {
+  axios = require("axios");
+  console.log("STEP 7: axios loaded");
+} catch (err) {
+  console.error("ERROR loading axios:", err);
+  process.exit(1);
+}
+
+try {
+  corsLib = require("cors");
+  console.log("STEP 8: cors loaded");
+} catch (err) {
+  console.error("ERROR loading cors:", err);
+  process.exit(1);
+}
+
+// Re-assign to your existing variable names so the rest of the file works:
+const path = pathModule;
+const cors = corsLib;
+
+// Keep your global crash handlers too if you want:
+process.on("uncaughtException", (err) => {
+  console.error("UNCAUGHT EXCEPTION:", err);
+});
+
+process.on("unhandledRejection", (reason) => {
+  console.error("UNHANDLED REJECTION:", reason);
+});
+
+// --------------------------------------------
+//  MAGNUS GARMIN ECC BACKEND (Node + SQLite)
+// --------------------------------------------
 require("dotenv").config();
 const express = require("express");
 const morgan = require("morgan");
@@ -254,3 +326,10 @@ app.post("/garmin/ipc-outbound", (req, res) => {
   logEvent("garmin_outbound", { events: handled });
   res.json({ status: "ok", eventsHandled: handled });
 });
+
+console.log("Bootstrapping MAGNUS Garmin ECC backend...");
+
+app.listen(PORT, () => {
+  console.log(`MAGNUS Garmin ECC backend running on port ${PORT}`);
+});
+
