@@ -8,6 +8,13 @@ const Database = require("better-sqlite3");
 const path = require("path");
 const axios = require("axios");
 const cors = require("cors");
+process.on("uncaughtException", (err) => {
+  console.error("UNCAUGHT EXCEPTION:", err);
+});
+
+process.on("unhandledRejection", (reason) => {
+  console.error("UNHANDLED REJECTION:", reason);
+});
 
 // --------------------------------------------
 // CONFIG
