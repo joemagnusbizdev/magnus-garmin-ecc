@@ -125,21 +125,51 @@ app.get("/health", (req, res) => {
 });
 
 // --------------------------------------------
+// --------------------------------------------
 // GARMIN OUTBOUND WEBHOOK
 // --------------------------------------------
 app.post("/garmin/ipc-outbound", (req, res) => {
-  // TEMP: log all headers so we can see what Garmin sends
-  console.log("HEADERS FROM GARMIN:", req.headers);
+  // Log everything so we can see what Garmin is doing
+  console.log("INCOMING /garmin/ipc-outbound HEADERS:", req.headers);
+  console.log(
+    "INCOMING /garmin/ipc-outbound BODY:",
+    JSON.stringify(req.body, null, 2)
+  );
 
-  const body = req.body;
-  if (!body || !Array.isArray(body.Events)) {
-    console.warn("[GarminOutbound] Invalid payload:", body);
-    return res.status(400).json({ error: "invalid payload" });
+  // TEMP: do NOT enforce token while we're debugging
+  // Later we'll put this back once we know which header Garmin actually uses
+  // const incomingToken = req.header("x-garmin-token");
+  // if (GARMIN_OUTBOUND_TOKEN && incomingToken !== GARMIN_OUTBOUND_TOKEN) {
+  //   console.warn("[GarminOutbound] Invalid token:", incomingToken);
+  //   return res.status(401).json({ error: "invalid token" });
+  // }
+
+  const body = req.body || {};
+
+  // Be flexible about the events array name
+  const events =
+    body.Events ||
+    body.events ||
+    body.OutboundEvents ||
+    body.outboundEvents ||
+    [];
+
+  // If Garmin is just doing a “connectivity test” with no events,
+  // don’t fail – just return 200 OK so the test passes.
+  if (!Array.isArray(events) || events.length === 0) {
+    console.warn(
+      "[GarminOutbound] No Events array on payload – likely a test call"
+    );
+    return res.json({
+      status: "ok",
+      eventsHandled: 0,
+      note: "no Events array; treated as test/heartbeat",
+    });
   }
 
   let handled = 0;
 
-  for (const ev of body.Events) {
+  for (const ev of events) {
     try {
       const imei = ev.imei;
       const ts = new Date().toISOString();
