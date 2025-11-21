@@ -121,12 +121,23 @@ app.get("/health", (req, res) => {
 // GARMIN OUTBOUND WEBHOOK
 // --------------------------------------------
 app.post("/garmin/ipc-outbound", (req, res) => {
-  const incomingToken = req.header("x-garmin-token");
+  console.log("HEADERS FROM GARMIN:", req.headers); // TEMP LOG
+
+  const incomingToken =
+    req.header("x-garmin-token") ||
+    req.header("x-auth-token") ||
+    req.header("authorization");
+
+  console.log("Resolved incoming token:", incomingToken);
 
   if (!incomingToken || incomingToken !== GARMIN_OUTBOUND_TOKEN) {
     console.warn("[GarminOutbound] Invalid token:", incomingToken);
     return res.status(401).json({ error: "invalid token" });
   }
+
+  // ... existing code ...
+});
+
 
   const body = req.body;
   if (!body || !Array.isArray(body.Events)) {
