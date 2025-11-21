@@ -1,13 +1,13 @@
 // --------------------------------------------
 //  MAGNUS GARMIN ECC BACKEND (Node + SQLite)
 // --------------------------------------------
-
 require("dotenv").config();
 const express = require("express");
 const morgan = require("morgan");
 const Database = require("better-sqlite3");
 const path = require("path");
 const axios = require("axios");
+const cors = require("cors");
 
 // --------------------------------------------
 // CONFIG
@@ -19,71 +19,59 @@ const INBOUND_USERNAME = process.env.INBOUND_USERNAME || "";
 const INBOUND_PASSWORD = process.env.INBOUND_PASSWORD || "";
 const INBOUND_BASE_URL =
   process.env.INBOUND_BASE_URL ||
-  "https://int-external-production.inreach.garmin.com/IPCInbound/Inbound.svc";
-
-const ECC_USERS_RAW = process.env.ECC_USERS || "";
-const ECC_USERS = ECC_USERS_RAW.split(",")
-  .map((entry) => entry.trim())
-  .filter(Boolean)
-  .map((entry) => {
-    const [username, password, role] = entry.split(":");
-    return {
-      username: username || "",
-      password: password || "",
-      role: (role || "ops").toLowerCase(),
-    };
-  });
-
-console.log("Loaded GARMIN_OUTBOUND_TOKEN =", GARMIN_OUTBOUND_TOKEN);
+  "https://eur-enterprise.inreach.garmin.com/IPCInbound/Inbound.svc";
 
 // --------------------------------------------
-// ECC BASIC AUTH
+// EXPRESS APP
 // --------------------------------------------
-function findUser(username, password) {
-  return ECC_USERS.find(
-    (u) => u.username === username && u.password === password
-  );
-}
+const app = express();
 
-function eccAuth(req, res, next) {
-  // Allow health + Garmin webhook without ECC auth
-  if (req.path === "/health" || req.path.startsWith("/garmin/ipc-outbound")) {
-    return next();
-  }
+app.use(
+  cors({
+    origin: "https://blog.magnusafety.com",
+  })
+);
 
-  const header = req.headers["authorization"] || "";
-  if (!header.startsWith("Basic ")) {
-    res.set("WWW-Authenticate", 'Basic realm="MAGNUS ECC"');
-    return res.status(401).send("Authentication required");
-  }
+app.use(express.json({ limit: "5mb" }));
+app.use(morgan("dev"));
 
-  const base64 = header.slice("Basic ".length);
-  let username = "";
-  let password = "";
+// --------------------------------------------
+//  MAGNUS GARMIN ECC BACKEND (Node + SQLite)
+// --------------------------------------------
+require("dotenv").config();
+const express = require("express");
+const morgan = require("morgan");
+const Database = require("better-sqlite3");
+const path = require("path");
+const axios = require("axios");
+const cors = require("cors");
 
-  try {
-    const decoded = Buffer.from(base64, "base64").toString("utf8");
-    [username, password] = decoded.split(":");
-  } catch (err) {
-    return res.status(400).send("Invalid auth encoding");
-  }
+// --------------------------------------------
+// CONFIG
+// --------------------------------------------
+const PORT = process.env.PORT || 4000;
+const GARMIN_OUTBOUND_TOKEN = process.env.GARMIN_OUTBOUND_TOKEN || "";
 
-  const user = findUser(username, password);
-  if (!user) return res.status(403).send("Forbidden");
+const INBOUND_USERNAME = process.env.INBOUND_USERNAME || "";
+const INBOUND_PASSWORD = process.env.INBOUND_PASSWORD || "";
+const INBOUND_BASE_URL =
+  process.env.INBOUND_BASE_URL ||
+  "https://eur-enterprise.inreach.garmin.com/IPCInbound/Inbound.svc";
 
-  req.eccUser = { username: user.username, role: user.role };
-  return next();
-}
+// --------------------------------------------
+// EXPRESS APP
+// --------------------------------------------
+const app = express();
 
-function requireRole(roles) {
-  const allowed = Array.isArray(roles) ? roles : [roles];
-  return function (req, res, next) {
-    if (!req.eccUser) return res.status(401).send("Unauthenticated");
-    if (!allowed.includes(req.eccUser.role))
-      return res.status(403).send("Forbidden");
-    next();
-  };
-}
+// Allow frontend on blog.magnusafety.com to call this API
+app.use(
+  cors({
+    origin: "https://blog.magnusafety.com",
+  })
+);
+
+app.use(express.json({ limit: "5mb" }));
+app.use(morgan("dev"));
 
 // --------------------------------------------
 // SQLITE DB
@@ -147,31 +135,15 @@ function logEvent(type, payload = {}) {
   console.log("[ECC]", JSON.stringify(entry));
 }
 
-// --------------------------------------------
-// EXPRESS APP
-// --------------------------------------------
-const app = express();
-app.use(express.json({ limit: "5mb" }));
-app.use(morgan("dev"));
-app.use(eccAuth);
-
-// --------------------------------------------
-// STATIC CONSOLE UI
-// --------------------------------------------
-app.use(
-  "/console",
-  express.static(path.join(__dirname, "public"), { index: "index.html" })
-);
-
-app.get("/console", (req, res) => {
-  res.sendFile(path.join(__dirname, "public", "index.html"));
-});
-
-// LOGOUT
-app.get("/logout", (req, res) => {
-  res.set("WWW-Authenticate", 'Basic realm="MAGNUS ECC"');
-  res.status(401).send("Logged out");
-});
+function upsertDeviceBase(imei, ts) {
+  db.prepare(
+    `
+    INSERT INTO devices (imei, last_event_at)
+    VALUES (?, ?)
+    ON CONFLICT(imei) DO UPDATE SET last_event_at=excluded.last_event_at
+  `
+  ).run(imei, ts);
+}
 
 // --------------------------------------------
 // HEALTH
@@ -181,14 +153,15 @@ app.get("/health", (req, res) => {
 });
 
 // --------------------------------------------
-// GARMIN OUTBOUND WEBHOOK (Garmin → ECC)
+// GARMIN OUTBOUND WEBHOOK
 // --------------------------------------------
 app.post("/garmin/ipc-outbound", (req, res) => {
   const incomingToken = req.header("x-garmin-token");
 
-  console.log(">>> Garmin outbound hit. x-garmin-token =", incomingToken);
-  console.log(">>> Server expects GARMIN_OUTBOUND_TOKEN =", GARMIN_OUTBOUND_TOKEN);
-  console.log(">>> All headers from Garmin:", req.headers);
+  if (!incomingToken || incomingToken !== GARMIN_OUTBOUND_TOKEN) {
+    console.warn("[GarminOutbound] Invalid token:", incomingToken);
+    return res.status(401).json({ error: "invalid token" });
+  }
 
   const body = req.body;
   if (!body || !Array.isArray(body.Events)) {
@@ -203,18 +176,15 @@ app.post("/garmin/ipc-outbound", (req, res) => {
       const imei = ev.imei;
       const ts = new Date().toISOString();
 
-      // Upsert device
-      db.prepare(
-        `INSERT INTO devices (imei, last_event_at)
-         VALUES (?, ?)
-         ON CONFLICT(imei) DO UPDATE SET last_event_at=excluded.last_event_at`
-      ).run(imei, ts);
+      upsertDeviceBase(imei, ts);
 
-      // Position event
+      // Position
       if (ev.point) {
         db.prepare(
-          `INSERT INTO positions (imei, lat, lon, altitude, gps_fix, timestamp)
-           VALUES (?, ?, ?, ?, ?, ?)`
+          `
+          INSERT INTO positions (imei, lat, lon, altitude, gps_fix, timestamp)
+          VALUES (?, ?, ?, ?, ?, ?)
+        `
         ).run(
           imei,
           ev.point.latitude,
@@ -225,24 +195,56 @@ app.post("/garmin/ipc-outbound", (req, res) => {
         );
 
         db.prepare(
-          `UPDATE devices
-           SET last_position_at = ?
-           WHERE imei = ?`
+          `
+          UPDATE devices
+          SET last_position_at = ?
+          WHERE imei = ?
+        `
+        ).run(ts, imei);
+      }
+
+      // Message text (if present)
+      if (ev.messageText || ev.moText) {
+        const text = ev.messageText || ev.moText || "";
+        const isSosMsg =
+          ev.messageCode === 300 ||
+          ev.messageCode === 301 ||
+          !!ev.isEmsMessage;
+
+        db.prepare(
+          `
+          INSERT INTO messages (imei, direction, text, timestamp, is_sos)
+          VALUES (?, 'inbound', ?, ?, ?)
+        `
+        ).run(imei, text, ts, isSosMsg ? 1 : 0);
+
+        db.prepare(
+          `
+          UPDATE devices
+          SET last_message_at = ?
+          WHERE imei = ?
+        `
         ).run(ts, imei);
       }
 
       // SOS events
       if (ev.messageCode === 300 || ev.messageCode === 301) {
-        db.prepare(
-          `INSERT INTO sos_events (imei, type, timestamp)
-           VALUES (?, ?, ?)`
-        ).run(imei, ev.messageCode === 300 ? "sos_declare" : "sos_clear", ts);
+        const type = ev.messageCode === 300 ? "sos_declare" : "sos_clear";
 
         db.prepare(
-          `UPDATE devices
-           SET is_active_sos = ?, last_sos_event_at = ?
-           WHERE imei = ?`
-        ).run(ev.messageCode === 300 ? 1 : 0, ts, imei);
+          `
+          INSERT INTO sos_events (imei, type, timestamp)
+          VALUES (?, ?, ?)
+        `
+        ).run(imei, type, ts);
+
+        db.prepare(
+          `
+          UPDATE devices
+          SET is_active_sos = ?, last_sos_event_at = ?
+          WHERE imei = ?
+        `
+        ).run(type === "sos_declare" ? 1 : 0, ts, imei);
       }
 
       handled++;
@@ -256,7 +258,7 @@ app.post("/garmin/ipc-outbound", (req, res) => {
 });
 
 // --------------------------------------------
-// INBOUND TO GARMIN (ECC → Garmin)
+// INBOUND TO GARMIN (Send message / SOS ACK / Request location)
 // --------------------------------------------
 async function garminInbound(method, payload) {
   const url = `${INBOUND_BASE_URL}/${method}`;
@@ -267,13 +269,13 @@ async function garminInbound(method, payload) {
   return axios.post(url, payload, { auth });
 }
 
-// SEND NORMAL MESSAGE
+// Send message to device
 app.post("/api/garmin/devices/:imei/message", async (req, res) => {
   const imei = req.params.imei;
-  const text = (req.body.text || "").trim();
+  const text = req.body.text || "";
 
-  if (!text) {
-    return res.status(400).json({ error: "empty message" });
+  if (!text.trim()) {
+    return res.status(400).json({ error: "empty text" });
   }
 
   try {
@@ -285,55 +287,20 @@ app.post("/api/garmin/devices/:imei/message", async (req, res) => {
     await garminInbound("SendMessage", payload);
 
     db.prepare(
-      `INSERT INTO messages (imei, direction, text, timestamp, is_sos)
-       VALUES (?, 'outbound', ?, ?, 0)`
+      `
+      INSERT INTO messages (imei, direction, text, timestamp, is_sos)
+      VALUES (?, 'outbound', ?, ?, 0)
+    `
     ).run(imei, text, new Date().toISOString());
-
-    db.prepare(
-      `UPDATE devices SET last_message_at=? WHERE imei=?`
-    ).run(new Date().toISOString(), imei);
 
     res.json({ ok: true });
   } catch (err) {
-    console.error("SendMessage error:", err.response?.data || err);
+    console.error("SendMessage error:", err.response?.data || err.message || err);
     res.status(500).json({ error: "failed to send message" });
   }
 });
 
-// SEND SOS MESSAGE
-app.post("/api/garmin/devices/:imei/sos/message", async (req, res) => {
-  const imei = req.params.imei;
-  const text = (req.body.text || "").trim();
-
-  if (!text) {
-    return res.status(400).json({ error: "empty message" });
-  }
-
-  try {
-    const payload = {
-      Recipient: { Imei: imei },
-      Message: { Text: text },
-    };
-
-    await garminInbound("SendEmsMessage", payload);
-
-    db.prepare(
-      `INSERT INTO messages (imei, direction, text, timestamp, is_sos)
-       VALUES (?, 'outbound', ?, ?, 1)`
-    ).run(imei, text, new Date().toISOString());
-
-    db.prepare(
-      `UPDATE devices SET last_message_at=? WHERE imei=?`
-    ).run(new Date().toISOString(), imei);
-
-    res.json({ ok: true });
-  } catch (err) {
-    console.error("SendEmsMessage error:", err.response?.data || err);
-    res.status(500).json({ error: "failed to send sos message" });
-  }
-});
-
-// SOS ACK (original route)
+// Acknowledge SOS
 app.post("/api/garmin/devices/:imei/ack-sos", async (req, res) => {
   const imei = req.params.imei;
 
@@ -342,155 +309,73 @@ app.post("/api/garmin/devices/:imei/ack-sos", async (req, res) => {
       Recipient: { Imei: imei },
     });
 
+    const now = new Date().toISOString();
+
     db.prepare(
-      `UPDATE devices SET last_sos_ack_at=?, is_active_sos=0
-       WHERE imei=?`
-    ).run(new Date().toISOString(), imei);
+      `
+      UPDATE devices
+      SET last_sos_ack_at = ?, is_active_sos = 0
+      WHERE imei = ?
+    `
+    ).run(now, imei);
+
+    db.prepare(
+      `
+      INSERT INTO sos_events (imei, type, timestamp)
+      VALUES (?, 'sos_ack', ?)
+    `
+    ).run(imei, now);
 
     res.json({ ok: true });
   } catch (err) {
-    console.error("AcknowledgeEms error:", err.response?.data || err);
+    console.error("AcknowledgeEms error:", err.response?.data || err.message || err);
     res.status(500).json({ error: "failed to ack sos" });
   }
 });
 
-// SOS ACK alias used by frontend
-app.post("/api/garmin/devices/:imei/sos/ack", async (req, res) => {
-  const imei = req.params.imei;
-
-  try {
-    await garminInbound("AcknowledgeEms", {
-      Recipient: { Imei: imei },
-    });
-
-    db.prepare(
-      `UPDATE devices SET last_sos_ack_at=?, is_active_sos=0
-       WHERE imei=?`
-    ).run(new Date().toISOString(), imei);
-
-    res.json({ ok: true });
-  } catch (err) {
-    console.error("AcknowledgeEms (alias) error:", err.response?.data || err);
-    res.status(500).json({ error: "failed to ack sos" });
-  }
-});
-
-// REQUEST LOCATION
+// Request location
 app.post("/api/garmin/devices/:imei/locate", async (req, res) => {
   const imei = req.params.imei;
 
   try {
-    await garminInbound("RequestLocation", {
+    await garminInbound("SendLocate", {
       Recipient: { Imei: imei },
     });
 
+    db.prepare(
+      `
+      INSERT INTO sos_events (imei, type, timestamp)
+      VALUES (?, 'locate_request', ?)
+    `
+    ).run(imei, new Date().toISOString());
+
     res.json({ ok: true });
   } catch (err) {
-    console.error("RequestLocation error:", err.response?.data || err);
+    console.error("SendLocate error:", err.response?.data || err.message || err);
     res.status(500).json({ error: "failed to request location" });
   }
 });
 
-// START TRACKING
-app.post("/api/garmin/devices/:imei/tracking/start", async (req, res) => {
-  const imei = req.params.imei;
+// --------------------------------------------
+// DEVICE LIST + GLOBAL MAP
+// --------------------------------------------
 
-  try {
-    await garminInbound("StartTracking", {
-      Recipient: { Imei: imei },
-    });
-
-    db.prepare(
-      `UPDATE devices SET tracking_enabled=1 WHERE imei=?`
-    ).run(imei);
-
-    res.json({ ok: true });
-  } catch (err) {
-    console.error("StartTracking error:", err.response?.data || err);
-    res.status(500).json({ error: "failed to start tracking" });
-  }
-});
-
-// STOP TRACKING
-app.post("/api/garmin/devices/:imei/tracking/stop", async (req, res) => {
-  const imei = req.params.imei;
-
-  try {
-    await garminInbound("StopTracking", {
-      Recipient: { Imei: imei },
-    });
-
-    db.prepare(
-      `UPDATE devices SET tracking_enabled=0 WHERE imei=?`
-    ).run(imei);
-
-    res.json({ ok: true });
-  } catch (err) {
-    console.error("StopTracking error:", err.response?.data || err);
-    res.status(500).json({ error: "failed to stop tracking" });
-  }
-});
-
-// CLOSE INCIDENT
-app.post(
-  "/api/garmin/devices/:imei/close",
-  requireRole("admin"),
-  (req, res) => {
-    const imei = req.params.imei;
-    const now = new Date().toISOString();
-
-    const info = db
-      .prepare(
-        `UPDATE devices
-         SET status='closed', closedAt=?
-         WHERE imei=?`
-      )
-      .run(now, imei);
-
-    if (info.changes === 0)
-      return res.status(404).json({ error: "not found" });
-
-    res.json({ ok: true, closedAt: now });
-  }
-);
-
-// SOS STATE – DB only
-app.get("/api/garmin/devices/:imei/sos/state", (req, res) => {
-  const imei = req.params.imei;
-
-  const row = db
-    .prepare(
-      `SELECT is_active_sos, last_sos_event_at, last_sos_ack_at
-       FROM devices
-       WHERE imei = ?`
-    )
-    .get(imei);
-
-  if (!row) {
-    return res.status(404).json({ error: "device not found" });
-  }
-
-  res.json({
-    isActiveSos: !!row.is_active_sos,
-    lastSosEventAt: row.last_sos_event_at || null,
-    lastSosAckAt: row.last_sos_ack_at || null,
-  });
-});
-
-// DEVICES LIST
+// List devices with last known position & SOS status
 app.get("/api/garmin/devices", (req, res) => {
   const rows = db.prepare("SELECT * FROM devices").all();
 
-  const getLastPositionStmt = db.prepare(
-    "SELECT lat, lon, gps_fix, timestamp FROM positions WHERE imei=? ORDER BY id DESC LIMIT 1"
-  );
-  const getLastMessageStmt = db.prepare(
-    "SELECT direction, text, timestamp, is_sos FROM messages WHERE imei=? ORDER BY id DESC LIMIT 1"
-  );
-
-  const devices = rows.map((d) => {
-    const lastPos = getLastPositionStmt.get(d.imei);
-    const lastMsg = getLastMessageStmt.get(d.imei);
+  const result = rows.map((d) => {
+    const lastPos = db
+      .prepare(
+        `
+        SELECT lat, lon, altitude, gps_fix, timestamp
+        FROM positions
+        WHERE imei = ?
+        ORDER BY timestamp DESC
+        LIMIT 1
+      `
+      )
+      .get(d.imei);
 
     return {
       imei: d.imei,
@@ -501,117 +386,169 @@ app.get("/api/garmin/devices", (req, res) => {
       lastMessageAt: d.last_message_at,
       lastSosEventAt: d.last_sos_event_at,
       lastSosAckAt: d.last_sos_ack_at,
-      trackingEnabled: !!d.tracking_enabled,
-      trackingInterval: d.tracking_interval || null,
       status: d.status || "open",
       closedAt: d.closedAt || null,
-      position: lastPos
+      lastPosition: lastPos
         ? {
             lat: lastPos.lat,
-            lng: lastPos.lon,
+            lon: lastPos.lon,
+            altitude: lastPos.altitude,
             gpsFix: !!lastPos.gps_fix,
             timestamp: lastPos.timestamp,
-          }
-        : null,
-      lastMessage: lastMsg
-        ? {
-            direction: lastMsg.direction,
-            text: lastMsg.text,
-            timestamp: lastMsg.timestamp,
-            isSos: !!lastMsg.is_sos,
           }
         : null,
     };
   });
 
-  res.json(devices);
+  res.json(result);
 });
 
-// DEVICE DETAIL
+// Global map endpoint: last positions of all devices
+app.get("/api/garmin/map/devices", (req, res) => {
+  const devices = db.prepare("SELECT * FROM devices").all();
+
+  const positions = devices.map((d) => {
+    const lastPos = db
+      .prepare(
+        `
+        SELECT lat, lon, altitude, gps_fix, timestamp
+        FROM positions
+        WHERE imei = ?
+        ORDER BY timestamp DESC
+        LIMIT 1
+      `
+      )
+      .get(d.imei);
+
+    if (!lastPos) return null;
+
+    return {
+      imei: d.imei,
+      label: d.label,
+      isActiveSos: !!d.is_active_sos,
+      status: d.status || "open",
+      lat: lastPos.lat,
+      lon: lastPos.lon,
+      altitude: lastPos.altitude,
+      gpsFix: !!lastPos.gps_fix,
+      timestamp: lastPos.timestamp,
+    };
+  });
+
+  res.json(positions.filter(Boolean));
+});
+
+// --------------------------------------------
+// DEVICE DETAILS + SOS TIMELINE
+// --------------------------------------------
+
+// Device details
 app.get("/api/garmin/devices/:imei", (req, res) => {
   const imei = req.params.imei;
 
-  const d = db
+  const device = db
     .prepare("SELECT * FROM devices WHERE imei = ?")
     .get(imei);
 
-  if (!d) return res.status(404).json({ error: "not found" });
+  if (!device) return res.status(404).json({ error: "not found" });
 
-  const lastPos = db
+  const messages = db
     .prepare(
-      "SELECT lat, lon, gps_fix, timestamp FROM positions WHERE imei=? ORDER BY id DESC LIMIT 1"
-    )
-    .get(imei);
-
-  let statusObj = {};
-  if (d.status_last_json) {
-    try {
-      statusObj = JSON.parse(d.status_last_json);
-    } catch (e) {
-      statusObj = {};
-    }
-  }
-
-  res.json({
-    imei: d.imei,
-    trackingEnabled: !!d.tracking_enabled,
-    trackingInterval: d.tracking_interval || null,
-    lastSosEventAt: d.last_sos_event_at,
-    lastSosAckAt: d.last_sos_ack_at,
-    status: statusObj,
-    position: lastPos
-      ? {
-          lat: lastPos.lat,
-          lng: lastPos.lon,
-          gpsFix: !!lastPos.gps_fix,
-          timestamp: lastPos.timestamp,
-        }
-      : null,
-  });
-});
-
-// MESSAGE HISTORY
-app.get("/api/garmin/devices/:imei/messages", (req, res) => {
-  const imei = req.params.imei;
-  const limit = Math.min(
-    parseInt(req.query.limit, 10) || 50,
-    200
-  );
-
-  const rows = db
-    .prepare(
-      "SELECT direction, text, timestamp, is_sos FROM messages WHERE imei=? ORDER BY id DESC LIMIT ?"
-    )
-    .all(imei, limit);
-
-  const messages = rows.map((m) => ({
-    direction: m.direction,
-    text: m.text,
-    timestamp: m.timestamp,
-    isSos: !!m.is_sos,
-  }));
-
-  res.json(messages);
-});
-
-// POSITIONS HISTORY
-app.get("/api/garmin/devices/:imei/positions", (req, res) => {
-  const imei = req.params.imei;
-
-  const rows = db
-    .prepare(
-      "SELECT lat, lon, gps_fix, timestamp FROM positions WHERE imei=? ORDER BY id ASC"
+      `
+      SELECT direction, text, timestamp, is_sos
+      FROM messages
+      WHERE imei = ?
+      ORDER BY timestamp ASC
+    `
     )
     .all(imei);
 
-  const points = rows.map((p) => ({
-    lat: p.lat,
-    lng: p.lon,
-    gpsFix: !!p.gps_fix,
-    timestamp: p.timestamp,
-  }));
+  const positions = db
+    .prepare(
+      `
+      SELECT lat, lon, altitude, gps_fix, timestamp
+      FROM positions
+      WHERE imei = ?
+      ORDER BY timestamp ASC
+    `
+    )
+    .all(imei);
 
-  res.json(points);
+  const sosEvents = db
+    .prepare(
+      `
+      SELECT type, timestamp
+      FROM sos_events
+      WHERE imei = ?
+      ORDER BY timestamp ASC
+    `
+    )
+    .all(imei);
+
+  res.json({
+    device,
+    messages,
+    positions,
+    sosEvents,
+  });
+});
+
+// SOS timeline: unified ordered list of events for a device
+app.get("/api/garmin/devices/:imei/timeline", (req, res) => {
+  const imei = req.params.imei;
+
+  const device = db
+    .prepare("SELECT * FROM devices WHERE imei = ?")
+    .get(imei);
+
+  if (!device) return res.status(404).json({ error: "not found" });
+
+  const rows = db
+    .prepare(
+      `
+      SELECT 'position' AS kind,
+             timestamp,
+             lat,
+             lon,
+             altitude,
+             gps_fix,
+             NULL AS text,
+             NULL AS sosType
+      FROM positions
+      WHERE imei = ?
+      UNION ALL
+      SELECT 'message' AS kind,
+             timestamp,
+             NULL,
+             NULL,
+             NULL,
+             NULL,
+             text,
+             CASE WHEN is_sos = 1 THEN 'sos_message' ELSE NULL END AS sosType
+      FROM messages
+      WHERE imei = ?
+      UNION ALL
+      SELECT 'sos_event' AS kind,
+             timestamp,
+             NULL,
+             NULL,
+             NULL,
+             NULL,
+             NULL,
+             type AS sosType
+      FROM sos_events
+      WHERE imei = ?
+      ORDER BY timestamp ASC
+    `
+    )
+    .all(imei, imei, imei);
+
+  res.json({
+    imei,
+    label: device.label,
+    isActiveSos: !!device.is_active_sos,
+    timeline: rows,
+  });
 });
 
 // --------------------------------------------
