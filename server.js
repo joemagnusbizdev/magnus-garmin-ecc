@@ -21,42 +21,7 @@ const INBOUND_BASE_URL =
   process.env.INBOUND_BASE_URL ||
   "https://eur-enterprise.inreach.garmin.com/IPCInbound/Inbound.svc";
 
-// --------------------------------------------
-// EXPRESS APP
-// --------------------------------------------
-const app = express();
 
-app.use(
-  cors({
-    origin: "https://blog.magnusafety.com",
-  })
-);
-
-app.use(express.json({ limit: "5mb" }));
-app.use(morgan("dev"));
-
-// --------------------------------------------
-//  MAGNUS GARMIN ECC BACKEND (Node + SQLite)
-// --------------------------------------------
-require("dotenv").config();
-const express = require("express");
-const morgan = require("morgan");
-const Database = require("better-sqlite3");
-const path = require("path");
-const axios = require("axios");
-const cors = require("cors");
-
-// --------------------------------------------
-// CONFIG
-// --------------------------------------------
-const PORT = process.env.PORT || 4000;
-const GARMIN_OUTBOUND_TOKEN = process.env.GARMIN_OUTBOUND_TOKEN || "";
-
-const INBOUND_USERNAME = process.env.INBOUND_USERNAME || "";
-const INBOUND_PASSWORD = process.env.INBOUND_PASSWORD || "";
-const INBOUND_BASE_URL =
-  process.env.INBOUND_BASE_URL ||
-  "https://eur-enterprise.inreach.garmin.com/IPCInbound/Inbound.svc";
 
 // --------------------------------------------
 // EXPRESS APP
