@@ -132,24 +132,25 @@ app.get("/health", (req, res) => {
 // --------------------------------------------
 // GARMIN OUTBOUND WEBHOOK
 // --------------------------------------------
-// Garmin will POST here with Events array
-app.post("/garmin/ipc-outbound", (req, res) => {
-  const incomingToken = req.header("x-garmin-token");
+pp.post("/garmin/ipc-outbound", (req, res) => {
+  console.log("INCOMING /garmin/ipc-outbound HEADERS:", req.headers);
+  console.log("INCOMING /garmin/ipc-outbound BODY:", JSON.stringify(req.body, null, 2));
 
-  // If you want to temporarily disable this check, comment this block out.
+  const incomingToken =
+    req.header("x-garmin-token") ||
+    req.header("x-garmin_token") ||
+    req.header("x-garmin-token".toLowerCase());
+
   if (!incomingToken || incomingToken !== GARMIN_OUTBOUND_TOKEN) {
-    console.warn("[GarminOutbound] Invalid token:", incomingToken);
+    console.warn("[GarminOutbound] Invalid token:", incomingToken, "expected:", GARMIN_OUTBOUND_TOKEN);
     return res.status(401).json({ error: "invalid token" });
   }
 
   const body = req.body;
-  console.log("INCOMING /garmin/ipc-outbound BODY:", JSON.stringify(body));
-
   if (!body || !Array.isArray(body.Events)) {
     console.warn("[GarminOutbound] Invalid payload:", body);
     return res.status(400).json({ error: "invalid payload" });
   }
-
   let handled = 0;
 
   for (const ev of body.Events) {
