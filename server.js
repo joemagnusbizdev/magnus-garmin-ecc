@@ -402,6 +402,69 @@ app.get("/api/garmin/devices", (req, res) => {
     res.status(500).json({ error: "failed to list devices" });
   }
 });
+// Messages list for a device (for center chat panel)
+app.get("/api/garmin/devices/:imei/messages", (req, res) => {
+  const imei = req.params.imei;
+  const limitRaw = req.query.limit;
+  let limit = parseInt(limitRaw, 10);
+
+  if (isNaN(limit) || limit <= 0 || limit > 500) {
+    limit = 50; // sane default
+  }
+
+  // Make sure device exists (optional but nicer)
+  const exists = db
+    .prepare("SELECT imei FROM devices WHERE imei = ?")
+    .get(imei);
+
+  if (!exists) {
+    return res.status(404).json({ error: "device not found" });
+  }
+
+  const rows = db
+    .prepare(
+      `
+      SELECT direction, text, timestamp, is_sos
+      FROM messages
+      WHERE imei = ?
+      ORDER BY timestamp DESC
+      LIMIT ?
+    `
+    )
+    .all(imei, limit);
+
+  res.json(rows);
+});
+// SOS state for a device (for the red banner)
+app.get("/api/garmin/devices/:imei/sos/state", (req, res) => {
+  const imei = req.params.imei;
+
+  const d = db
+    .prepare(
+      `
+      SELECT imei,
+             is_active_sos,
+             last_sos_event_at,
+             last_sos_ack_at
+      FROM devices
+      WHERE imei = ?
+    `
+    )
+    .get(imei);
+
+  if (!d) {
+    return res.status(404).json({ error: "device not found" });
+  }
+
+  res.json({
+    imei: d.imei,
+    isActiveSos: !!d.is_active_sos,
+    lastSosEventAt: d.last_sos_event_at,
+    lastSosAckAt: d.last_sos_ack_at,
+  });
+});
+
+
 
 // Global map endpoint: last positions of all devices
 app.get("/api/garmin/map/devices", (req, res) => {
