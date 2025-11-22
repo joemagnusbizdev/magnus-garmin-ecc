@@ -282,7 +282,39 @@ app.post("/api/garmin/devices/:imei/message", async (req, res) => {
   }
 });
 
-// Acknowledge SOS
+// SOS message (same as message, but flagged as SOS)
+app.post("/api/garmin/devices/:imei/sos/message", async (req, res) => {
+  const imei = req.params.imei;
+  const text = req.body.text || "";
+
+  if (!text.trim()) {
+    return res.status(400).json({ error: "empty text" });
+  }
+
+  try {
+    const payload = {
+      Recipient: { Imei: imei },
+      Message: { Text: text },
+    };
+
+    await garminInbound("SendMessage", payload);
+
+    db.prepare(
+      "INSERT INTO messages (imei, direction, text, timestamp, is_sos) " +
+        "VALUES (?, 'outbound', ?, ?, 1)"
+    ).run(imei, text, new Date().toISOString());
+
+    res.json({ ok: true });
+  } catch (err) {
+    console.error(
+      "SOS SendMessage error:",
+      (err && err.response && err.response.data) || err.message || err
+    );
+    res.status(500).json({ error: "failed to send sos message" });
+  }
+});
+
+// Acknowledge SOS (original route)
 app.post("/api/garmin/devices/:imei/ack-sos", async (req, res) => {
   const imei = req.params.imei;
 
@@ -311,6 +343,35 @@ app.post("/api/garmin/devices/:imei/ack-sos", async (req, res) => {
   }
 });
 
+// Alias for FE route: /sos/ack
+app.post("/api/garmin/devices/:imei/sos/ack", async (req, res) => {
+  const imei = req.params.imei;
+
+  try {
+    await garminInbound("AcknowledgeEms", {
+      Recipient: { Imei: imei },
+    });
+
+    const now = new Date().toISOString();
+
+    db.prepare(
+      "UPDATE devices SET last_sos_ack_at = ?, is_active_sos = 0 WHERE imei = ?"
+    ).run(now, imei);
+
+    db.prepare(
+      "INSERT INTO sos_events (imei, type, timestamp) VALUES (?, 'sos_ack', ?)"
+    ).run(imei, now);
+
+    res.json({ ok: true });
+  } catch (err) {
+    console.error(
+      "AcknowledgeEms (alias) error:",
+      (err && err.response && err.response.data) || err.message || err
+    );
+    res.status(500).json({ error: "failed to ack sos" });
+  }
+});
+
 // Request location
 app.post("/api/garmin/devices/:imei/locate", async (req, res) => {
   const imei = req.params.imei;
@@ -332,6 +393,52 @@ app.post("/api/garmin/devices/:imei/locate", async (req, res) => {
     );
     res.status(500).json({ error: "failed to request location" });
   }
+});
+
+// Tracking start/stop (stubbed – DB only)
+app.post("/api/garmin/devices/:imei/tracking/start", (req, res) => {
+  const imei = req.params.imei;
+  const interval =
+    typeof req.body.interval === "number" && req.body.interval > 0
+      ? req.body.interval
+      : 600; // default 10 min
+
+  db.prepare(
+    "UPDATE devices SET tracking_enabled = 1, tracking_interval = ? WHERE imei = ?"
+  ).run(interval, imei);
+
+  logEvent("tracking_start", { imei, interval });
+
+  res.json({ ok: true, simulated: true });
+});
+
+app.post("/api/garmin/devices/:imei/tracking/stop", (req, res) => {
+  const imei = req.params.imei;
+
+  db.prepare(
+    "UPDATE devices SET tracking_enabled = 0 WHERE imei = ?"
+  ).run(imei);
+
+  logEvent("tracking_stop", { imei });
+
+  res.json({ ok: true, simulated: true });
+});
+
+// Close incident
+app.post("/api/garmin/devices/:imei/close", (req, res) => {
+  const imei = req.params.imei;
+  const now = new Date().toISOString();
+
+  const result = db
+    .prepare("UPDATE devices SET status = 'closed', closedAt = ? WHERE imei = ?")
+    .run(now, imei);
+
+  if (result.changes === 0) {
+    return res.status(404).json({ error: "not found" });
+  }
+
+  logEvent("incident_close", { imei, closedAt: now });
+  res.json({ ok: true, closedAt: now });
 });
 
 // --------------------------------------------
@@ -415,7 +522,7 @@ app.get("/api/garmin/map/devices", (req, res) => {
   res.json(positions);
 });
 
-// Device details
+// Device details (full bundle: device + messages + positions + sosEvents)
 app.get("/api/garmin/devices/:imei", (req, res) => {
   const imei = req.params.imei;
 
@@ -453,6 +560,58 @@ app.get("/api/garmin/devices/:imei", (req, res) => {
     messages: messages,
     positions: positions,
     sosEvents: sosEvents,
+  });
+});
+
+// Messages-only endpoint (for ?limit=50 usage)
+app.get("/api/garmin/devices/:imei/messages", (req, res) => {
+  const imei = req.params.imei;
+  const limitRaw = req.query.limit;
+  let limit = parseInt(limitRaw, 10);
+  if (isNaN(limit) || limit <= 0) {
+    limit = null;
+  }
+
+  let baseSql =
+    "SELECT direction, text, timestamp, is_sos " +
+    "FROM messages WHERE imei = ? ORDER BY timestamp DESC";
+  if (limit) {
+    baseSql += " LIMIT " + limit;
+  }
+
+  const rows = db.prepare(baseSql).all(imei);
+  res.json(rows);
+});
+
+// Positions-only endpoint (for track drawing)
+app.get("/api/garmin/devices/:imei/positions", (req, res) => {
+  const imei = req.params.imei;
+  const rows = db
+    .prepare(
+      "SELECT lat, lon, altitude, gps_fix, timestamp " +
+        "FROM positions WHERE imei = ? ORDER BY timestamp ASC"
+    )
+    .all(imei);
+  res.json(rows);
+});
+
+// SOS state endpoint (simple object)
+app.get("/api/garmin/devices/:imei/sos/state", (req, res) => {
+  const imei = req.params.imei;
+
+  const d = db
+    .prepare("SELECT * FROM devices WHERE imei = ?")
+    .get(imei);
+
+  if (!d) {
+    return res.status(404).json({ error: "not found" });
+  }
+
+  res.json({
+    imei: d.imei,
+    isActiveSos: d.is_active_sos ? true : false,
+    lastSosEventAt: d.last_sos_event_at,
+    lastSosAckAt: d.last_sos_ack_at,
   });
 });
 
