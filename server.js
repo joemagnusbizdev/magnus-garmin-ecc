@@ -243,7 +243,7 @@ app.post("/api/garmin/devices/:imei/message", async (req, res) => {
 app.post("/api/garmin/devices/:imei/ack-sos", async (req, res) => {
   const imei = req.params.imei;
 
-  try:
+  try {
     await callInbound("AcknowledgeEms", { Recipient: { Imei: imei } });
 
     const now = new Date().toISOString();
