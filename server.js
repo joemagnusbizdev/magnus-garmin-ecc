@@ -253,6 +253,196 @@ app.post("/garmin/ipc-outbound", (req, res) => {
   logEvent("garmin_outbound", { events: handled });
   res.json({ status: "ok", eventsHandled: handled });
 });
+// --------------------------------------------
+// DEVICE LIST + GLOBAL MAP
+// --------------------------------------------
+
+// List devices with last known position & SOS status
+app.get("/api/garmin/devices", (req, res) => {
+  const rows = db.prepare("SELECT * FROM devices").all();
+
+  const result = rows.map((d) => {
+    const lastPos = db
+      .prepare(
+        `
+        SELECT lat, lon, altitude, gps_fix, timestamp
+        FROM positions
+        WHERE imei = ?
+        ORDER BY timestamp DESC
+        LIMIT 1
+      `
+      )
+      .get(d.imei);
+
+    return {
+      imei: d.imei,
+      label: d.label,
+      isActiveSos: !!d.is_active_sos,
+      lastEventAt: d.last_event_at,
+      lastPositionAt: d.last_position_at,
+      lastMessageAt: d.last_message_at,
+      lastSosEventAt: d.last_sos_event_at,
+      lastSosAckAt: d.last_sos_ack_at,
+      status: d.status || "open",
+      closedAt: d.closedAt || null,
+      lastPosition: lastPos
+        ? {
+            lat: lastPos.lat,
+            lon: lastPos.lon,
+            altitude: lastPos.altitude,
+            gpsFix: !!lastPos.gps_fix,
+            timestamp: lastPos.timestamp,
+          }
+        : null,
+    };
+  });
+
+  res.json(result);
+});
+
+// Global map endpoint: last positions of all devices
+app.get("/api/garmin/map/devices", (req, res) => {
+  const devices = db.prepare("SELECT * FROM devices").all();
+
+  const positions = devices.map((d) => {
+    const lastPos = db
+      .prepare(
+        `
+        SELECT lat, lon, altitude, gps_fix, timestamp
+        FROM positions
+        WHERE imei = ?
+        ORDER BY timestamp DESC
+        LIMIT 1
+      `
+      )
+      .get(d.imei);
+
+    if (!lastPos) return null;
+
+    return {
+      imei: d.imei,
+      label: d.label,
+      isActiveSos: !!d.is_active_sos,
+      status: d.status || "open",
+      lat: lastPos.lat,
+      lon: lastPos.lon,
+      altitude: lastPos.altitude,
+      gpsFix: !!lastPos.gps_fix,
+      timestamp: lastPos.timestamp,
+    };
+  });
+
+  res.json(positions.filter(Boolean));
+});
+
+// Device details
+app.get("/api/garmin/devices/:imei", (req, res) => {
+  const imei = req.params.imei;
+
+  const device = db
+    .prepare("SELECT * FROM devices WHERE imei = ?")
+    .get(imei);
+
+  if (!device) return res.status(404).json({ error: "not found" });
+
+  const messages = db
+    .prepare(
+      `
+      SELECT direction, text, timestamp, is_sos
+      FROM messages
+      WHERE imei = ?
+      ORDER BY timestamp ASC
+    `
+    )
+    .all(imei);
+
+  const positions = db
+    .prepare(
+      `
+      SELECT lat, lon, altitude, gps_fix, timestamp
+      FROM positions
+      WHERE imei = ?
+      ORDER BY timestamp ASC
+    `
+    )
+    .all(imei);
+
+  const sosEvents = db
+    .prepare(
+      `
+      SELECT type, timestamp
+      FROM sos_events
+      WHERE imei = ?
+      ORDER BY timestamp ASC
+    `
+    )
+    .all(imei);
+
+  res.json({
+    device,
+    messages,
+    positions,
+    sosEvents,
+  });
+});
+
+// SOS timeline: unified ordered list of events for a device
+app.get("/api/garmin/devices/:imei/timeline", (req, res) => {
+  const imei = req.params.imei;
+
+  const device = db
+    .prepare("SELECT * FROM devices WHERE imei = ?")
+    .get(imei);
+
+  if (!device) return res.status(404).json({ error: "not found" });
+
+  const rows = db
+    .prepare(
+      `
+      SELECT 'position' AS kind,
+             timestamp,
+             lat,
+             lon,
+             altitude,
+             gps_fix,
+             NULL AS text,
+             NULL AS sosType
+      FROM positions
+      WHERE imei = ?
+      UNION ALL
+      SELECT 'message' AS kind,
+             timestamp,
+             NULL,
+             NULL,
+             NULL,
+             NULL,
+             text,
+             CASE WHEN is_sos = 1 THEN 'sos_message' ELSE NULL END AS sosType
+      FROM messages
+      WHERE imei = ?
+      UNION ALL
+      SELECT 'sos_event' AS kind,
+             timestamp,
+             NULL,
+             NULL,
+             NULL,
+             NULL,
+             NULL,
+             type AS sosType
+      FROM sos_events
+      WHERE imei = ?
+      ORDER BY timestamp ASC
+    `
+    )
+    .all(imei, imei, imei);
+
+  res.json({
+    imei,
+    label: device.label,
+    isActiveSos: !!device.is_active_sos,
+    timeline: rows,
+  });
+});
 
 console.log("Bootstrapping MAGNUS Garmin ECC backend...");
 
