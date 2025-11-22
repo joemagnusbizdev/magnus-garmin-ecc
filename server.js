@@ -132,37 +132,49 @@ app.get("/health", (req, res) => {
 // --------------------------------------------
 // GARMIN OUTBOUND WEBHOOK
 // --------------------------------------------
-pp.post("/garmin/ipc-outbound", (req, res) => {
-  console.log("INCOMING /garmin/ipc-outbound HEADERS:", req.headers);
-  console.log("INCOMING /garmin/ipc-outbound BODY:", JSON.stringify(req.body, null, 2));
+app.post("/garmin/ipc-outbound", (req, res) => {
+  console.log(
+    "INCOMING /garmin/ipc-outbound HEADERS:",
+    JSON.stringify(req.headers, null, 2)
+  );
+  console.log(
+    "INCOMING /garmin/ipc-outbound BODY:",
+    JSON.stringify(req.body, null, 2)
+  );
 
-  const incomingToken =
-    req.header("x-garmin-token") ||
-    req.header("x-garmin_token") ||
-    req.header("x-garmin-token".toLowerCase());
-
-  if (!incomingToken || incomingToken !== GARMIN_OUTBOUND_TOKEN) {
-    console.warn("[GarminOutbound] Invalid token:", incomingToken, "expected:", GARMIN_OUTBOUND_TOKEN);
-    return res.status(401).json({ error: "invalid token" });
-  }
+  // TEMP: token check disabled until we confirm header name/value from Garmin
+  // const incomingToken =
+  //   req.header("x-garmin-token") ||
+  //   req.header("x-garmin_token") ||
+  //   req.header("x-ipc-token");
+  //
+  // if (!incomingToken || incomingToken !== GARMIN_OUTBOUND_TOKEN) {
+  //   console.warn(
+  //     "[GarminOutbound] Invalid token:",
+  //     incomingToken,
+  //     "expected:",
+  //     GARMIN_OUTBOUND_TOKEN
+  //   );
+  //   return res.status(401).json({ error: "invalid token" });
+  // }
 
   const body = req.body;
   if (!body || !Array.isArray(body.Events)) {
     console.warn("[GarminOutbound] Invalid payload:", body);
     return res.status(400).json({ error: "invalid payload" });
   }
+
   let handled = 0;
 
   for (const ev of body.Events) {
     try {
       const imei = ev.imei;
-      if (!imei) continue;
-
       const ts = new Date().toISOString();
+
       upsertDeviceBase(imei, ts);
 
       // Position
-      if (ev.point && typeof ev.point.latitude === "number" && typeof ev.point.longitude === "number") {
+      if (ev.point) {
         db.prepare(
           `
           INSERT INTO positions (imei, lat, lon, altitude, gps_fix, timestamp)
@@ -172,7 +184,7 @@ pp.post("/garmin/ipc-outbound", (req, res) => {
           imei,
           ev.point.latitude,
           ev.point.longitude,
-          ev.point.altitude || 0,
+          ev.point.altitude,
           ev.point.gpsFix ? 1 : 0,
           ts
         );
@@ -186,9 +198,9 @@ pp.post("/garmin/ipc-outbound", (req, res) => {
         ).run(ts, imei);
       }
 
-      // Message text – Garmin test events often use freeText
-      const rawText = ev.messageText || ev.moText || ev.freeText || "";
-      if (rawText && rawText.trim().length > 0) {
+      // Message text (if present)
+      if (ev.messageText || ev.moText || ev.freeText) {
+        const text = ev.messageText || ev.moText || ev.freeText || "";
         const isSosMsg =
           ev.messageCode === 300 ||
           ev.messageCode === 301 ||
@@ -199,7 +211,7 @@ pp.post("/garmin/ipc-outbound", (req, res) => {
           INSERT INTO messages (imei, direction, text, timestamp, is_sos)
           VALUES (?, 'inbound', ?, ?, ?)
         `
-        ).run(imei, rawText, ts, isSosMsg ? 1 : 0);
+        ).run(imei, text, ts, isSosMsg ? 1 : 0);
 
         db.prepare(
           `
@@ -210,7 +222,7 @@ pp.post("/garmin/ipc-outbound", (req, res) => {
         ).run(ts, imei);
       }
 
-      // SOS events based on messageCode
+      // SOS events
       if (ev.messageCode === 300 || ev.messageCode === 301) {
         const type = ev.messageCode === 300 ? "sos_declare" : "sos_clear";
 
@@ -230,18 +242,6 @@ pp.post("/garmin/ipc-outbound", (req, res) => {
         ).run(type === "sos_declare" ? 1 : 0, ts, imei);
       }
 
-      // Store last status JSON if provided
-      if (ev.status) {
-        const serialized = JSON.stringify(ev.status);
-        db.prepare(
-          `
-          UPDATE devices
-          SET status_last_json = ?
-          WHERE imei = ?
-        `
-        ).run(serialized, imei);
-      }
-
       handled++;
     } catch (err) {
       console.error("Error handling outbound event:", err);
@@ -251,7 +251,6 @@ pp.post("/garmin/ipc-outbound", (req, res) => {
   logEvent("garmin_outbound", { events: handled });
   res.json({ status: "ok", eventsHandled: handled });
 });
-
 // --------------------------------------------
 // INBOUND TO GARMIN (Send message / SOS ACK / Request location)
 // --------------------------------------------
