@@ -435,34 +435,42 @@ app.get("/api/garmin/devices/:imei/messages", (req, res) => {
 
   res.json(rows);
 });
-// SOS state for a device (for the red banner)
+// --------------------------------------------
+// SOS STATE: SIMPLE, NEVER 404
+// --------------------------------------------
 app.get("/api/garmin/devices/:imei/sos/state", (req, res) => {
   const imei = req.params.imei;
 
-  const d = db
+  // Try get the device row
+  const row = db
     .prepare(
       `
-      SELECT imei,
-             is_active_sos,
-             last_sos_event_at,
-             last_sos_ack_at
+      SELECT imei, is_active_sos, last_sos_event_at, last_sos_ack_at
       FROM devices
       WHERE imei = ?
     `
     )
     .get(imei);
 
-  if (!d) {
-    return res.status(404).json({ error: "device not found" });
+  // If device not found, just return a neutral state
+  if (!row) {
+    return res.json({
+      imei,
+      isActiveSos: false,
+      lastSosEventAt: null,
+      lastSosAckAt: null,
+    });
   }
 
+  // Normal case: device exists
   res.json({
-    imei: d.imei,
-    isActiveSos: !!d.is_active_sos,
-    lastSosEventAt: d.last_sos_event_at,
-    lastSosAckAt: d.last_sos_ack_at,
+    imei: row.imei,
+    isActiveSos: !!row.is_active_sos,
+    lastSosEventAt: row.last_sos_event_at || null,
+    lastSosAckAt: row.last_sos_ack_at || null,
   });
 });
+
 
 
 
