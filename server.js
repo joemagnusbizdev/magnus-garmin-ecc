@@ -12,166 +12,23 @@ const app = express();
 const PORT = process.env.PORT || 10000;
 
 // Comma-separated list of allowed frontends
-// e.g. "https://blog.magnusafety.com,https://magnusafety.com,http://localhost:3000"
 const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS ||
   "https://blog.magnusafety.com,https://magnusafety.com,http://localhost:3000")
   .split(",")
   .map((o) => o.trim())
   .filter(Boolean);
 
-// Simple API key for your internal frontend calls (devices, map, etc.)
-const INTERNAL_API_KEY = process.env.INTERNAL_API_KEY || "";
+// Internal API key used by the ECC frontend
+// (env overrides, but default is MAGNUS302010! as requested)
+const INTERNAL_API_KEY = process.env.INTERNAL_API_KEY || "MAGNUS302010!";
 
-// Garmin outbound auth token – must match what Garmin sends in x-outbound-auth-token
-// Example (from your test): EDF01295
-const GARMIN_OUTBOUND_AUTH_TOKEN = process.env.GARMIN_OUTBOUND_AUTH_TOKEN || "";
-
-// --- IN-MEMORY DEVICE STORE -----------------------------------------
-
-/**
- * Very simple in-memory store:
- *  Map<imei, {
- *    imei, label, status, isActiveSos,
- *    lastPosition, lastPositionAt,
- *    lastMessageAt, lastEventAt,
- *    lastSosEventAt, lastSosAckAt,
- *    messages[], positions[]
- *  }>
- */
-const devicesStore = new Map();
-
-/**
- * Try to normalize a Garmin IPC payload into our device model
- * `body` is the JSON Garmin posts to /garmin/ipc-outbound
- */
-function upsertDeviceFromIpc(body) {
-  const events = Array.isArray(body?.Events) ? body.Events : [];
-  if (events.length === 0) {
-    console.log("[DevicesStore] No Events in payload");
-    return;
-  }
-
-  events.forEach((ev, idx) => {
-    // --- IMEI detection (try multiple common paths) ------------------
-    let imei =
-      ev.DeviceImei ||
-      ev.deviceImei ||
-      ev?.Device?.Imei ||
-      ev?.Device?.IMEI ||
-      body.DeviceImei ||
-      body.Imei ||
-      null;
-
-    if (!imei) {
-      imei = "VIRTUAL-TEST";
-      console.log(
-        `[DevicesStore] No IMEI in event[${idx}] – falling back to`,
-        imei
-      );
-    }
-
-    const now = new Date().toISOString();
-
-    const existing = devicesStore.get(imei) || {
-      imei,
-      label: imei,
-      status: "open",
-      isActiveSos: false,
-      lastPosition: null,
-      lastPositionAt: null,
-      lastMessageAt: null,
-      lastEventAt: null,
-      lastSosEventAt: null,
-      lastSosAckAt: null,
-      messages: [],
-      positions: [],
-    };
-
-    // --- generic "this device had an event" timestamp ----------------
-    existing.lastEventAt = now;
-
-    // --- SOS detection -----------------------------------------------
-    const type = ev.EventType || ev.Type || "";
-    const typeStr = (typeof type === "string" ? type : "").toLowerCase();
-    const isSosEvent = typeStr.includes("sos");
-
-    if (isSosEvent) {
-      existing.isActiveSos = true;
-      existing.lastSosEventAt = now;
-    }
-
-    // --- Position parsing (best-effort guesses) ----------------------
-    const pos = ev.Position || ev.PositionInfo || ev.Location || null;
-    if (pos) {
-      const lat =
-        pos.Latitude ??
-        pos.latitude ??
-        pos.Lat ??
-        pos.lat ??
-        null;
-      const lon =
-        pos.Longitude ??
-        pos.longitude ??
-        pos.Lon ??
-        pos.lon ??
-        null;
-
-      if (lat != null && lon != null) {
-        const ts =
-          pos.Timestamp ||
-          pos.Time ||
-          ev.Timestamp ||
-          ev.EventTime ||
-          now;
-
-        const p = {
-          lat: Number(lat),
-          lon: Number(lon),
-          timestamp: ts,
-          gpsFix: true,
-        };
-
-        existing.lastPosition = p;
-        existing.lastPositionAt = ts;
-        existing.positions = existing.positions || [];
-        existing.positions.push(p);
-      }
-    }
-
-    // --- Message parsing (if present) --------------------------------
-    if (ev.MessageText || ev.Message || ev.Text) {
-      const text = ev.MessageText || ev.Message || ev.Text;
-      const dirRaw = ev.Direction || "";
-      const ts =
-        ev.Timestamp || ev.MessageTime || ev.EventTime || now;
-
-      const msg = {
-        direction: dirRaw.toLowerCase().includes("out")
-          ? "outbound"
-          : "inbound",
-        text,
-        timestamp: ts,
-        is_sos: isSosEvent,
-      };
-
-      existing.lastMessageAt = ts;
-      existing.messages = existing.messages || [];
-      existing.messages.push(msg);
-    }
-
-    devicesStore.set(imei, existing);
-    console.log(
-      "[DevicesStore] Upserted device",
-      imei,
-      "Total devices:",
-      devicesStore.size
-    );
-  });
-}
+// Garmin outbound auth token – must match x-outbound-auth-token header
+const GARMIN_OUTBOUND_AUTH_TOKEN =
+  process.env.GARMIN_OUTBOUND_AUTH_TOKEN || "";
 
 // --- MIDDLEWARE ------------------------------------------------------
 
-app.set("trust proxy", true); // because you're behind Render/Cloudflare
+app.set("trust proxy", true); // behind Render/CF
 
 app.use(
   cors({
@@ -188,10 +45,12 @@ app.use(
 app.use(express.json({ limit: "5mb" }));
 app.use(morgan("combined"));
 
+// --- HELPER MIDDLEWARE -----------------------------------------------
+
 function authenticateApiKey(req, res, next) {
   if (!INTERNAL_API_KEY) {
     console.warn(
-      "[APIAuth] INTERNAL_API_KEY not set – all /api routes are open. Set it in Render env."
+      "[APIAuth] INTERNAL_API_KEY not set – all /api routes are open. Set it in env."
     );
     return next();
   }
@@ -238,6 +97,96 @@ function authenticateGarminOutbound(req, res, next) {
   return next();
 }
 
+// --- SIMPLE IN-MEMORY DEVICE STORE ----------------------------------
+
+const devicesStore = new Map();
+
+function getOrCreateDevice(imei) {
+  if (!devicesStore.has(imei)) {
+    const now = new Date().toISOString();
+    devicesStore.set(imei, {
+      imei,
+      label: imei,
+      status: "open",
+      isActiveSos: false,
+      lastPosition: null,
+      lastPositionAt: null,
+      lastMessageAt: null,
+      lastEventAt: null,
+      lastSosEventAt: null,
+      lastSosAckAt: null,
+      messages: [],
+      positions: [],
+      events: [],
+      createdAt: now,
+      updatedAt: now,
+    });
+  }
+  return devicesStore.get(imei);
+}
+
+function listDevices() {
+  return Array.from(devicesStore.values());
+}
+
+function upsertPosition(imei, position) {
+  const d = getOrCreateDevice(imei);
+  d.positions.push(position);
+  d.lastPosition = position;
+  d.lastPositionAt = position.timestamp || new Date().toISOString();
+  d.lastEventAt = d.lastPositionAt;
+  d.updatedAt = new Date().toISOString();
+}
+
+function upsertMessage(imei, msg) {
+  const d = getOrCreateDevice(imei);
+  d.messages.push(msg);
+  d.lastMessageAt = msg.timestamp || new Date().toISOString();
+  d.lastEventAt = d.lastMessageAt;
+  d.updatedAt = new Date().toISOString();
+}
+
+function markSos(imei, opts) {
+  const d = getOrCreateDevice(imei);
+  if (opts.active != null) {
+    d.isActiveSos = opts.active;
+  }
+  if (opts.eventAt) {
+    d.lastSosEventAt = opts.eventAt;
+    d.lastEventAt = opts.eventAt;
+  }
+  if (opts.ackAt) {
+    d.lastSosAckAt = opts.ackAt;
+    d.lastEventAt = opts.ackAt;
+  }
+  d.updatedAt = new Date().toISOString();
+}
+
+function closeIncident(imei) {
+  const d = getOrCreateDevice(imei);
+  d.status = "closed";
+  d.updatedAt = new Date().toISOString();
+}
+
+// Helper to pull IMEI out of many possible IPC shapes
+function extractImeiFromEvent(evt) {
+  if (!evt || typeof evt !== "object") return null;
+
+  if (evt.device && (evt.device.imei || evt.device.Imei)) {
+    return evt.device.imei || evt.device.Imei;
+  }
+  if (evt.Device && (evt.Device.IMEI || evt.Device.Imei)) {
+    return evt.Device.IMEI || evt.Device.Imei;
+  }
+  if (evt.imei || evt.Imei || evt.IMEI) {
+    return evt.imei || evt.Imei || evt.IMEI;
+  }
+  if (evt.inReachDevice && (evt.inReachDevice.imei || evt.inReachDevice.Imei)) {
+    return evt.inReachDevice.imei || evt.inReachDevice.Imei;
+  }
+  return null;
+}
+
 // --- HEALTHCHECK -----------------------------------------------------
 
 app.head("/", (req, res) => {
@@ -252,31 +201,111 @@ app.get("/", (req, res) => {
   });
 });
 
-// --- FRONTEND API ROUTES ---------------------------------------------
-// ECC UI will call these from blog.magnusafety.com
+// --- SIMPLE OPERATOR LOGIN ------------------------------------------
+// Frontend will call this, but the token is *not* enforced yet.
+// Security for now is basically INTERNAL_API_KEY + obscurity.
 
-// LIST DEVICES (used by ECC sidebar + map)
+app.post("/api/auth/login", authenticateApiKey, (req, res) => {
+  const { username, password } = req.body || {};
+  if (!username || !password) {
+    return res.status(400).json({ error: "Missing username or password" });
+  }
+
+  // For now, accept any non-empty credentials and return a dummy token.
+  const token = `op-${username}-${Date.now()}`;
+  console.log("[OperatorLogin] Login ok for user:", username);
+  res.json({ token });
+});
+
+// --- FRONTEND API ROUTES (USED BY ECC UI) ---------------------------
+
+// List devices (used by left sidebar + markers)
 app.get("/api/garmin/devices", authenticateApiKey, (req, res) => {
-  const devices = Array.from(devicesStore.values());
-  res.json(devices); // bare array – your frontend normalizes this
+  res.json(listDevices());
 });
 
-// MAP DEVICES (if you want a lighter payload later)
+// Detailed view – used when clicking a device in the UI
+app.get("/api/garmin/devices/:imei", authenticateApiKey, (req, res) => {
+  const { imei } = req.params;
+  if (!devicesStore.has(imei)) {
+    return res.status(404).json({ error: "Device not found" });
+  }
+  const d = devicesStore.get(imei);
+  res.json({
+    device: {
+      ...d,
+      // Don't send the raw events array by default
+      events: undefined,
+    },
+    messages: d.messages,
+    positions: d.positions,
+  });
+});
+
+// Send a message to a device (frontend stub – real send would hit Garmin API)
+app.post(
+  "/api/garmin/devices/:imei/message",
+  authenticateApiKey,
+  (req, res) => {
+    const { imei } = req.params;
+    const { text, isSos } = req.body || {};
+
+    if (!text || typeof text !== "string") {
+      return res.status(400).json({ error: "Missing message text" });
+    }
+
+    const now = new Date().toISOString();
+    const msg = {
+      id: `local-${Date.now()}`,
+      direction: "outbound",
+      text,
+      timestamp: now,
+      is_sos: !!isSos,
+      via: "ECC",
+    };
+
+    upsertMessage(imei, msg);
+
+    if (isSos) {
+      markSos(imei, { active: true, eventAt: now });
+    }
+
+    console.log("[Message] outbound message stored for", imei);
+    res.json({ ok: true });
+  }
+);
+
+// Acknowledge SOS (button in UI)
+app.post(
+  "/api/garmin/devices/:imei/ack-sos",
+  authenticateApiKey,
+  (req, res) => {
+    const { imei } = req.params;
+    const now = new Date().toISOString();
+    markSos(imei, { active: false, ackAt: now });
+    console.log("[SOS] ack for", imei);
+    res.json({ ok: true });
+  }
+);
+
+// Request location (stub – call Garmin Professional API in real version)
+app.post(
+  "/api/garmin/devices/:imei/locate",
+  authenticateApiKey,
+  (req, res) => {
+    const { imei } = req.params;
+    console.log("[Locate] requested new location for", imei);
+    res.json({ ok: true });
+  }
+);
+
+// Devices for map overlay (currently same as listDevices)
 app.get("/api/garmin/map/devices", authenticateApiKey, (req, res) => {
-  const devices = Array.from(devicesStore.values()).map((d) => ({
-    imei: d.imei,
-    label: d.label,
-    status: d.status,
-    isActiveSos: d.isActiveSos,
-    lastPosition: d.lastPosition,
-    lastPositionAt: d.lastPositionAt,
-  }));
-  res.json(devices);
+  res.json(listDevices());
 });
 
-// --- GARMIN IPC OUTBOUND ENDPOINT ------------------------------------
-// This is the URL you gave Garmin as the IPC outbound webhook
-// e.g. https://magnus-garmin-ecc.onrender.com/garmin/ipc-outbound
+// --- GARMIN IPC OUTBOUND ENDPOINT -----------------------------------
+// Garmin IPC webhook calls this with SOS, messages, positions, etc.
 
 app.post(
   "/garmin/ipc-outbound",
@@ -285,6 +314,7 @@ app.post(
     try {
       const { headers, body } = req;
 
+      // Minimal header log for debugging
       console.log("HEADERS FROM GARMIN:", {
         host: headers.host,
         "user-agent": headers["user-agent"],
@@ -301,10 +331,122 @@ app.post(
         body && Object.keys(body)
       );
 
-      // ⬇️ NEW: store into in-memory devices for ECC
-      upsertDeviceFromIpc(body);
+      const events = (body && body.Events) || body?.events || [];
+      if (!Array.isArray(events)) {
+        console.log("[GarminOutbound] No Events array in payload");
+      } else {
+        events.forEach((evt, idx) => {
+          let imei = extractImeiFromEvent(evt);
+          if (!imei) {
+            imei = "VIRTUAL-TEST";
+            console.log(
+              "[DevicesStore] No IMEI in event index",
+              idx,
+              "- using VIRTUAL-TEST"
+            );
+          }
 
-      // For Garmin: always respond 200 quickly
+          const dev = getOrCreateDevice(imei);
+
+          const baseTs =
+            evt.timestamp ||
+            evt.Timestamp ||
+            evt.eventTime ||
+            new Date().toISOString();
+
+          // Generic event record
+          dev.events.push({
+            rawType: evt.Type || evt.type || evt.EventType || "unknown",
+            raw: evt,
+            timestamp: baseTs,
+          });
+          dev.lastEventAt = baseTs;
+          dev.updatedAt = new Date().toISOString();
+
+          const type = (evt.Type || evt.type || "").toLowerCase();
+
+          // --- POSITION-LIKE EVENTS ---
+          if (evt.Position || evt.position || type === "position") {
+            const p = evt.Position || evt.position || evt;
+            const lat = p.Latitude ?? p.latitude ?? p.lat;
+            const lon = p.Longitude ?? p.longitude ?? p.lon;
+
+            if (lat != null && lon != null) {
+              const pos = {
+                lat: Number(lat),
+                lon: Number(lon),
+                timestamp:
+                  p.Timestamp ||
+                  p.timestamp ||
+                  p.FixTime ||
+                  baseTs,
+                gpsFix: p.GpsFix ?? p.gpsFix ?? true,
+              };
+              upsertPosition(imei, pos);
+            }
+          }
+
+          // --- MESSAGE-LIKE EVENTS ---
+          if (evt.Message || evt.message || type === "message") {
+            const m = evt.Message || evt.message || evt;
+            const text =
+              m.Text ||
+              m.text ||
+              m.Body ||
+              m.body ||
+              m.MessageText ||
+              "";
+            const direction =
+              m.Direction ||
+              m.direction ||
+              (m.IsOutbound ? "outbound" : "inbound");
+
+            const msg = {
+              id: m.Id || m.id || `evt-${idx}-${Date.now()}`,
+              direction:
+                (direction || "").toLowerCase() === "outbound"
+                  ? "outbound"
+                  : "inbound",
+              text,
+              timestamp: m.Timestamp || m.timestamp || baseTs,
+              is_sos: !!(m.IsSos || m.isSos || m.Sos || m.sos),
+              via: "Garmin IPC",
+            };
+
+            upsertMessage(imei, msg);
+          }
+
+          // --- SOS EVENTS ---
+          const rawType = (evt.Type || evt.type || "").toLowerCase();
+          const subType = (evt.SubType || evt.subType || "").toLowerCase();
+          const sosFlag =
+            evt.IsSos ||
+            evt.isSos ||
+            rawType.includes("sos") ||
+            subType.includes("sos");
+
+          if (
+            sosFlag ||
+            rawType === "sostriggered" ||
+            rawType === "sos_triggered"
+          ) {
+            markSos(imei, { active: true, eventAt: baseTs });
+          } else if (
+            rawType === "soscleared" ||
+            rawType === "sos_cleared" ||
+            subType === "cleared"
+          ) {
+            markSos(imei, { active: false, eventAt: baseTs });
+          }
+        });
+
+        console.log(
+          "[DevicesStore] After IPC, total devices:",
+          devicesStore.size
+        );
+      }
+
+      // Always respond quickly to Garmin
       res.status(200).json({ ok: true });
     } catch (err) {
       console.error("[GarminOutbound] Handler error:", err);
