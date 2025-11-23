@@ -326,10 +326,8 @@ app.post(
         "x-forwarded-for": headers["x-forwarded-for"],
       });
 
-      console.log(
-        "[GarminOutbound] Received IPC payload, top-level keys:",
-        body && Object.keys(body)
-      );
+     console.log("[GarminOutbound] FULL IPC PAYLOAD:", JSON.stringify(body, null, 2));
+
 
       const events = (body && body.Events) || body?.events || [];
       if (!Array.isArray(events)) {
