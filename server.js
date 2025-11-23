@@ -11,7 +11,7 @@ const app = express();
 
 const PORT = process.env.PORT || 10000;
 
-// Frontends allowed to call this backend
+// Allowed frontends (CORS)
 const ALLOWED_ORIGINS = (
   process.env.ALLOWED_ORIGINS ||
   "https://blog.magnusafety.com,https://magnusafety.com,http://localhost:3000"
@@ -20,12 +20,19 @@ const ALLOWED_ORIGINS = (
   .map((o) => o.trim())
   .filter(Boolean);
 
-// Garmin outbound auth token – must match what Garmin sends in x-outbound-auth-token
-// Example from your test: EDF01295
+// Garmin outbound auth token – must match what Garmin sends
 const GARMIN_OUTBOUND_AUTH_TOKEN =
   process.env.GARMIN_OUTBOUND_AUTH_TOKEN || "";
 
-// In-memory store for devices (reset on restart)
+// In-memory devices store (reset on restart)
+// imei -> {
+//   imei, label, status, isActiveSos,
+//   lastEventAt, lastPositionAt, lastMessageAt,
+//   lastSosEventAt, lastSosAckAt,
+//   lastPosition: { lat, lon, timestamp, gpsFix },
+//   positions: [ { lat, lon, timestamp } ],
+//   messages: [ { direction, text, timestamp, is_sos } ]
+// }
 const devicesStore = {};
 
 // --- MIDDLEWARE ------------------------------------------------------
@@ -35,7 +42,6 @@ app.set("trust proxy", true);
 app.use(
   cors({
     origin(origin, callback) {
-      // Allow non-browser tools (no origin) and whitelisted origins
       if (!origin || ALLOWED_ORIGINS.includes(origin)) {
         return callback(null, true);
       }
@@ -49,9 +55,9 @@ app.use(morgan("combined"));
 
 // --- HELPER MIDDLEWARE ----------------------------------------------
 
-// 🔓 DEV MODE: internal API key check is DISABLED for now.
-// All /api routes are open so the ECC can talk to the backend without headers.
+// 🔓 Dev mode: API key check disabled so frontend can talk freely
 function authenticateApiKey(req, res, next) {
+  // If you want to re-enable later, add INTERNAL_API_KEY logic here.
   return next();
 }
 
@@ -79,32 +85,37 @@ function authenticateGarminOutbound(req, res, next) {
   return next();
 }
 
-// --- SIMPLE DEVICE HELPERS ------------------------------------------
+// --- DEVICE HELPERS -------------------------------------------------
 
-function upsertDevice(imei, partial) {
+function getOrCreateDevice(imei) {
   if (!imei) imei = "VIRTUAL-TEST";
+  if (!devicesStore[imei]) {
+    devicesStore[imei] = {
+      imei,
+      label: imei === "VIRTUAL-TEST" ? "Garmin Virtual Test" : `Device ${imei}`,
+      status: "open",
+      isActiveSos: false,
+      lastEventAt: null,
+      lastPositionAt: null,
+      lastMessageAt: null,
+      lastSosEventAt: null,
+      lastSosAckAt: null,
+      lastPosition: null,
+      positions: [],
+      messages: [],
+    };
+  }
+  return devicesStore[imei];
+}
 
-  const existing = devicesStore[imei] || {};
-  const now = new Date().toISOString();
-
-  devicesStore[imei] = {
-    imei,
-    label: existing.label || partial.label || "Garmin Device",
-    status: partial.status || existing.status || "open",
-    isActiveSos:
-      typeof partial.isActiveSos === "boolean"
-        ? partial.isActiveSos
-        : existing.isActiveSos || false,
-    lastEventAt: partial.lastEventAt || existing.lastEventAt || now,
-    lastPosition: partial.lastPosition || existing.lastPosition || null,
-  };
-
-  console.log(
-    "[DevicesStore] Upserted device",
-    imei,
-    ". Total devices:",
-    Object.keys(devicesStore).length
-  );
+function deviceSummary(device) {
+  // Strip large arrays when listing all devices
+  const {
+    positions,
+    messages,
+    ...rest
+  } = device;
+  return rest;
 }
 
 // --- HEALTHCHECK -----------------------------------------------------
@@ -122,12 +133,12 @@ app.get("/", (req, res) => {
 });
 
 // --- FRONTEND API ROUTES ---------------------------------------------
-// These are what your ECC frontend calls.
+// These are what your ECC JS calls.
 
-// List devices for sidebar + map
+// List devices (sidebar + map)
 app.get("/api/garmin/devices", authenticateApiKey, async (req, res) => {
   try {
-    const list = Object.values(devicesStore);
+    const list = Object.values(devicesStore).map(deviceSummary);
     res.json(list); // ECC expects an array
   } catch (err) {
     console.error("[/api/garmin/devices] Error:", err);
@@ -135,10 +146,10 @@ app.get("/api/garmin/devices", authenticateApiKey, async (req, res) => {
   }
 });
 
-// Devices for map overlay (same data shape for now)
+// Map devices (you can shape differently later if needed)
 app.get("/api/garmin/map/devices", authenticateApiKey, async (req, res) => {
   try {
-    const list = Object.values(devicesStore);
+    const list = Object.values(devicesStore).map(deviceSummary);
     res.json(list);
   } catch (err) {
     console.error("[/api/garmin/map/devices] Error:", err);
@@ -146,9 +157,94 @@ app.get("/api/garmin/map/devices", authenticateApiKey, async (req, res) => {
   }
 });
 
+// Device detail: used after sending message / ack SOS
+// ECC expects: { device, messages, positions }
+app.get(
+  "/api/garmin/devices/:imei",
+  authenticateApiKey,
+  async (req, res) => {
+    const imei = req.params.imei;
+    const device = devicesStore[imei];
+    if (!device) {
+      return res.status(404).json({ error: "Device not found" });
+    }
+
+    res.json({
+      device: deviceSummary(device),
+      messages: device.messages || [],
+      positions: device.positions || [],
+    });
+  }
+);
+
+// Send message to device (ECC then re-fetches detail)
+app.post(
+  "/api/garmin/devices/:imei/message",
+  authenticateApiKey,
+  async (req, res) => {
+    const imei = req.params.imei;
+    const { text } = req.body || {};
+    if (!text || !text.trim()) {
+      return res.status(400).json({ error: "Missing text" });
+    }
+
+    const device = getOrCreateDevice(imei);
+    const now = new Date().toISOString();
+
+    const msg = {
+      direction: "outbound",
+      text: text.trim(),
+      timestamp: now,
+      is_sos: text.trim().startsWith("SOS:") || false,
+    };
+
+    device.messages.push(msg);
+    device.lastMessageAt = now;
+    device.lastEventAt = now;
+
+    // TODO: here you would actually call Garmin Messaging API
+
+    res.json({ ok: true });
+  }
+);
+
+// Acknowledge SOS (ECC then re-fetches list + detail)
+app.post(
+  "/api/garmin/devices/:imei/ack-sos",
+  authenticateApiKey,
+  async (req, res) => {
+    const imei = req.params.imei;
+    const device = getOrCreateDevice(imei);
+    const now = new Date().toISOString();
+
+    device.isActiveSos = false;
+    device.lastSosAckAt = now;
+    device.lastEventAt = now;
+
+    // TODO: send SOS ack to Garmin (if API supports)
+
+    res.json({ ok: true });
+  }
+);
+
+// Request location (ECC just shows "request sent")
+app.post(
+  "/api/garmin/devices/:imei/locate",
+  authenticateApiKey,
+  async (req, res) => {
+    const imei = req.params.imei;
+    const device = getOrCreateDevice(imei);
+
+    // TODO: call Garmin "locate" / tracking API.
+    // For now we just acknowledge the request.
+    device.lastEventAt = new Date().toISOString();
+
+    res.json({ ok: true });
+  }
+);
+
 // --- GARMIN IPC OUTBOUND ENDPOINT ------------------------------------
-// This is the URL you gave to Garmin:
-//   https://magnus-garmin-ecc.onrender.com/garmin/ipc-outbound
+// URL registered with Garmin: /garmin/ipc-outbound
 
 app.post(
   "/garmin/ipc-outbound",
@@ -172,18 +268,18 @@ app.post(
         body && Object.keys(body)
       );
 
-      // Very simple example handling:
-      // Grab IMEI if present; for virtual test, fall back to VIRTUAL-TEST.
       let imei = null;
 
+      // ⚠️ We don't know exact schema yet, so we keep this generic.
+      // Once you paste a real sample body we can map fields properly.
       try {
         if (body && Array.isArray(body.Events) && body.Events.length > 0) {
           const evt = body.Events[0];
-          // IMEI location will depend on Garmin payload structure – adjust later.
+
           imei =
             evt.DeviceImei ||
             evt.Imei ||
-            (evt.Device && evt.Device.IMEI) ||
+            (evt.Device && (evt.Device.IMEI || evt.Device.Imei)) ||
             null;
         }
       } catch (e) {
@@ -195,12 +291,22 @@ app.post(
         imei = "VIRTUAL-TEST";
       }
 
-      // Minimal upsert – you can enrich this once you map Garmin fields.
-      upsertDevice(imei, {
-        label: imei === "VIRTUAL-TEST" ? "Garmin Virtual Test" : `Device ${imei}`,
-        isActiveSos: true, // assume test is SOS-like; adjust when you parse event types
-        lastEventAt: new Date().toISOString(),
-      });
+      const device = getOrCreateDevice(imei);
+      const now = new Date().toISOString();
+
+      // Minimal update so the ECC shows *something*
+      device.lastEventAt = now;
+
+      // Naive assumption: treat virtual test as SOS-like
+      device.isActiveSos = true;
+      device.lastSosEventAt = device.lastSosEventAt || now;
+
+      console.log(
+        "[DevicesStore] Upserted device",
+        imei,
+        ". Total devices:",
+        Object.keys(devicesStore).length
+      );
 
       // Respond quickly to Garmin
       res.status(200).json({ ok: true });
