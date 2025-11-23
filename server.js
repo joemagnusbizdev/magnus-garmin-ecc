@@ -264,9 +264,10 @@ app.post(
       });
 
       console.log(
-        "[GarminOutbound] Received IPC payload, top-level keys:",
-        body && Object.keys(body)
-      );
+  "[GarminOutbound] FULL IPC payload:",
+  JSON.stringify(body, null, 2)
+);
+
 
       let imei = null;
 
