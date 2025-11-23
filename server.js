@@ -5,14 +5,15 @@ const express = require("express");
 const cors = require("cors");
 const morgan = require("morgan");
 
+// Node 18+ has global fetch; if not, you'd need node-fetch.
+// Here we assume Render is on a modern Node (it is).
 const app = express();
 
 // --- CONFIG ----------------------------------------------------------
 
 const PORT = process.env.PORT || 10000;
 
-// Comma-separated list of allowed frontends
-// e.g. "https://blog.magnusafety.com,https://magnusafety.com,http://localhost:3000"
+// Frontend origins allowed to call this backend
 const ALLOWED_ORIGINS = (
   process.env.ALLOWED_ORIGINS ||
   "https://blog.magnusafety.com,https://magnusafety.com,http://localhost:3000"
@@ -21,153 +22,26 @@ const ALLOWED_ORIGINS = (
   .map((o) => o.trim())
   .filter(Boolean);
 
-// Internal API key used by the ECC frontend (x-api-key)
-const INTERNAL_API_KEY = process.env.INTERNAL_API_KEY || "MAGNUS302010!";
+// Internal API key used by ECC frontend (index.html)
+const INTERNAL_API_KEY =
+  process.env.INTERNAL_API_KEY || "MAGNUS302010!";
 
-// Garmin outbound auth token – must match what Garmin sends
-// in x-outbound-auth-token header (e.g. EDF01295)
+// Outbound token used by Garmin -> our /garmin/ipc-outbound
 const GARMIN_OUTBOUND_AUTH_TOKEN =
   process.env.GARMIN_OUTBOUND_AUTH_TOKEN || "";
 
-// --- SIMPLE IN-MEMORY DEVICE STORE ----------------------------------
-
-class DevicesStore {
-  constructor() {
-    this.devices = new Map(); // key: imei, value: device record
-  }
-
-  _ensureDevice(imei) {
-    if (!this.devices.has(imei)) {
-      this.devices.set(imei, {
-        imei,
-        label: imei,
-        status: "open",
-        isActiveSos: false,
-
-        lastPosition: null,
-        lastPositionAt: null,
-        lastMessageAt: null,
-        lastEventAt: null,
-        lastSosEventAt: null,
-        lastSosAckAt: null,
-
-        // history
-        messages: [],
-        positions: [],
-      });
-    }
-    return this.devices.get(imei);
-  }
-
-  upsertFromIpcEvent(event) {
-    const imei = event.imei || "VIRTUAL-TEST";
-
-    // Try to interpret timestamp – Garmin sends ms since epoch
-    let tsMs =
-      typeof event.timeStamp === "number" ? event.timeStamp : Date.now();
-    let ts = new Date(tsMs);
-    if (isNaN(ts.getTime())) {
-      ts = new Date();
-    }
-    const tsIso = ts.toISOString();
-
-    const dev = this._ensureDevice(imei);
-
-    // Basic fields
-    dev.lastEventAt = tsIso;
-
-    // Position
-    if (event.point && typeof event.point.latitude === "number") {
-      const p = {
-        lat: event.point.latitude,
-        lon: event.point.longitude,
-        altitude: event.point.altitude,
-        gpsFix: event.point.gpsFix,
-        course: event.point.course,
-        speed: event.point.speed,
-        timestamp: tsIso,
-      };
-      dev.positions.push(p);
-      dev.lastPosition = p;
-      dev.lastPositionAt = tsIso;
-    }
-
-    // Interpret messageCode – we'll treat 6 as SOS (inbound)
-    const messageCode = event.messageCode;
-    const isSos = messageCode === 6;
-
-    // Free text / message
-    const text =
-      event.freeText && event.freeText.trim().length > 0
-        ? event.freeText
-        : `Garmin event (code ${messageCode})`;
-
-    dev.messages.push({
-      id: dev.messages.length + 1,
-      direction: "inbound",
-      is_sos: isSos,
-      text,
-      timestamp: tsIso,
-    });
-
-    dev.lastMessageAt = tsIso;
-
-    if (isSos) {
-      dev.isActiveSos = true;
-      dev.lastSosEventAt = tsIso;
-      dev.status = "open";
-    }
-
-    return dev;
-  }
-
-  listSummaries() {
-    return Array.from(this.devices.values()).map((d) => ({
-      imei: d.imei,
-      label: d.label,
-      status: d.status || "open",
-      isActiveSos: !!d.isActiveSos,
-      lastPosition: d.lastPosition,
-      lastPositionAt: d.lastPositionAt,
-      lastMessageAt: d.lastMessageAt,
-      lastEventAt: d.lastEventAt,
-      lastSosEventAt: d.lastSosEventAt,
-      lastSosAckAt: d.lastSosAckAt,
-    }));
-  }
-
-  getDevice(imei) {
-    return this.devices.get(imei) || null;
-  }
-
-  ackSos(imei) {
-    const dev = this.devices.get(imei);
-    if (!dev) return null;
-    dev.isActiveSos = false;
-    dev.lastSosAckAt = new Date().toISOString();
-    return dev;
-  }
-
-  addOutboundMessage(imei, text, opts = {}) {
-    const dev = this._ensureDevice(imei);
-    const tsIso = new Date().toISOString();
-    dev.messages.push({
-      id: dev.messages.length + 1,
-      direction: "outbound",
-      is_sos: !!opts.isSos,
-      text,
-      timestamp: tsIso,
-    });
-    dev.lastMessageAt = tsIso;
-    return dev;
-  }
-}
-
-const devicesStore = new DevicesStore();
+// IPC Inbound (we call Garmin to send messages / locate / etc.)
+const IPC_INBOUND_BASE_URL =
+  process.env.IPC_INBOUND_BASE_URL ||
+  "https://eur-enterprise.inreach.garmin.com";
+const IPC_INBOUND_USERNAME =
+  process.env.IPC_INBOUND_USERNAME || "MagnusDash";
+const IPC_INBOUND_PASSWORD =
+  process.env.IPC_INBOUND_PASSWORD || "MagnusDash1";
 
 // --- MIDDLEWARE ------------------------------------------------------
 
-app.set("trust proxy", true); // behind Render / CF
+app.set("trust proxy", true);
 
 app.use(
   cors({
@@ -184,12 +58,12 @@ app.use(
 app.use(express.json({ limit: "5mb" }));
 app.use(morgan("combined"));
 
-// --- AUTH MIDDLEWARE -------------------------------------------------
+// --- HELPER MIDDLEWARE -----------------------------------------------
 
 function authenticateApiKey(req, res, next) {
   if (!INTERNAL_API_KEY) {
     console.warn(
-      "[APIAuth] INTERNAL_API_KEY not set – all /api routes are open. Set it in Render env."
+      "[APIAuth] INTERNAL_API_KEY not set – /api routes are open. Set it in env."
     );
     return next();
   }
@@ -236,7 +110,7 @@ function authenticateGarminOutbound(req, res, next) {
   return next();
 }
 
-// --- HEALTHCHECK -----------------------------------------------------
+// --- SIMPLE HEALTHCHECK ----------------------------------------------
 
 app.head("/", (req, res) => {
   res.sendStatus(200);
@@ -250,155 +124,137 @@ app.get("/", (req, res) => {
   });
 });
 
-// --- OPERATOR LOGIN (DUMMY) ------------------------------------------
-// Simple login just to let the frontend show a login screen.
-// In real life you would check a DB / IdP etc.
+// --- IN-MEMORY DEVICE STORE ------------------------------------------
+// This lets us build /api/garmin/devices and device detail/chat view.
 
-app.post("/api/auth/login", (req, res) => {
-  const { username, password } = req.body || {};
-  if (!username || !password) {
-    return res.status(400).json({ error: "Missing username or password" });
+class DevicesStore {
+  constructor() {
+    /** @type {Map<string, any>} */
+    this.devices = new Map();
   }
 
-  // TODO: replace with real auth. For now accept anything non-empty.
-  const tokenPayload = {
-    sub: username,
-    role: "operator",
-    iat: Date.now(),
-  };
-
-  // Very simple fake token
-  const fakeToken = Buffer.from(JSON.stringify(tokenPayload)).toString(
-    "base64url"
-  );
-
-  return res.json({ token: fakeToken });
-});
-
-// --- FRONTEND API ROUTES ---------------------------------------------
-// These require x-api-key from the ECC frontend.
-
-// List devices (summary)
-app.get("/api/garmin/devices", authenticateApiKey, async (req, res) => {
-  try {
-    const list = devicesStore.listSummaries();
-    res.json(list);
-  } catch (err) {
-    console.error("[/api/garmin/devices] Error:", err);
-    res.status(500).json({ error: "Failed to fetch devices" });
-  }
-});
-
-// Map devices – for now same as summaries
-app.get("/api/garmin/map/devices", authenticateApiKey, async (req, res) => {
-  try {
-    const list = devicesStore.listSummaries();
-    res.json(list);
-  } catch (err) {
-    console.error("[/api/garmin/map/devices] Error:", err);
-    res.status(500).json({ error: "Failed to fetch map devices" });
-  }
-});
-
-// Device detail
-app.get(
-  "/api/garmin/devices/:imei",
-  authenticateApiKey,
-  async (req, res) => {
-    try {
-      const imei = req.params.imei;
-      const dev = devicesStore.getDevice(imei);
-      if (!dev) {
-        return res.status(404).json({ error: "Device not found" });
-      }
-      res.json({ device: dev });
-    } catch (err) {
-      console.error("[GET /api/garmin/devices/:imei] Error:", err);
-      res.status(500).json({ error: "Failed to fetch device detail" });
-    }
-  }
-);
-
-// Send message (stubbed – no actual Garmin outbound yet)
-app.post(
-  "/api/garmin/devices/:imei/message",
-  authenticateApiKey,
-  async (req, res) => {
-    try {
-      const imei = req.params.imei;
-      const { text } = req.body || {};
-      if (!text || !text.trim()) {
-        return res.status(400).json({ error: "Message text is required" });
-      }
-
-      console.log(
-        "[OutboundMessage] (stub) To IMEI",
+  _ensureDevice(imei) {
+    if (!this.devices.has(imei)) {
+      this.devices.set(imei, {
         imei,
-        "text:",
-        JSON.stringify(text)
-      );
-
-      const dev = devicesStore.addOutboundMessage(imei, text, {
-        isSos: /^SOS:/i.test(text),
+        label: imei,
+        status: "open",
+        isActiveSos: false,
+        lastPosition: null,
+        lastPositionAt: null,
+        lastMessageAt: null,
+        lastEventAt: null,
+        lastSosEventAt: null,
+        messages: [], // chat history
+        positions: [], // track history
       });
-
-      // TODO: wire this to real Garmin send API.
-      res.json({ ok: true, device: dev });
-    } catch (err) {
-      console.error("[POST /api/garmin/devices/:imei/message] Error:", err);
-      res.status(500).json({ error: "Failed to send message" });
     }
+    return this.devices.get(imei);
   }
-);
 
-// Acknowledge SOS
-app.post(
-  "/api/garmin/devices/:imei/ack-sos",
-  authenticateApiKey,
-  async (req, res) => {
-    try {
-      const imei = req.params.imei;
-      const dev = devicesStore.ackSos(imei);
-      if (!dev) {
-        return res.status(404).json({ error: "Device not found" });
+  upsertFromIpcEvent(ev) {
+    const imei = ev.imei || ev.Imei || ev.IMEI || "UNKNOWN";
+    const dev = this._ensureDevice(imei);
+
+    // Label – you can improve later (e.g. from Garmin user info)
+    if (!dev.label) dev.label = imei;
+
+    // Timestamp
+    const tsMs = typeof ev.timeStamp === "number" ? ev.timeStamp : null;
+    const ts =
+      tsMs && tsMs > 0 ? new Date(tsMs).toISOString() : null;
+
+    // Position
+    if (ev.point && typeof ev.point.latitude === "number" && typeof ev.point.longitude === "number") {
+      const p = {
+        lat: ev.point.latitude,
+        lon: ev.point.longitude,
+        altitude: ev.point.altitude,
+        gpsFix: ev.point.gpsFix,
+        course: ev.point.course,
+        speed: ev.point.speed,
+        timestamp: ts,
+      };
+      dev.lastPosition = p;
+      dev.lastPositionAt = ts;
+      // push into history (cap at 200)
+      dev.positions.push(p);
+      if (dev.positions.length > 200) {
+        dev.positions.shift();
       }
+    }
 
-      // Log an outbound "ack" message in the conversation
-      devicesStore.addOutboundMessage(imei, "[SOS acknowledged by operator]", {
-        isSos: true,
+    // Message / event
+    dev.lastEventAt = ts || dev.lastEventAt;
+
+    // If this is a message or SOS-ish event
+    const mCode = ev.messageCode;
+    const freeText = ev.freeText || "";
+
+    // Very simple SOS detection: treat messageCode 6 as SOS start
+    // You can refine this based on full docs.
+    const isSosEvent = mCode === 6;
+
+    if (freeText || isSosEvent) {
+      dev.messages.push({
+        direction: "inbound",
+        text: freeText || (isSosEvent ? "Emergency/SOS event" : ""),
+        is_sos: !!isSosEvent,
+        timestamp: ts || new Date().toISOString(),
       });
-
-      res.json({ ok: true, device: dev });
-    } catch (err) {
-      console.error("[POST /api/garmin/devices/:imei/ack-sos] Error:", err);
-      res.status(500).json({ error: "Failed to acknowledge SOS" });
+      if (dev.messages.length > 500) {
+        dev.messages.shift();
+      }
+      dev.lastMessageAt = ts || dev.lastMessageAt;
     }
-  }
-);
 
-// Locate request (stub only)
-app.post(
-  "/api/garmin/devices/:imei/locate",
-  authenticateApiKey,
-  async (req, res) => {
-    try {
-      const imei = req.params.imei;
-      console.log(
-        "[LocateRequest] (stub) Locate request for IMEI",
-        imei
-      );
-      // TODO: wire to real Garmin locate endpoint
-      res.json({ ok: true });
-    } catch (err) {
-      console.error("[POST /api/garmin/devices/:imei/locate] Error:", err);
-      res.status(500).json({ error: "Failed to send locate request" });
+    if (isSosEvent) {
+      dev.isActiveSos = true;
+      dev.lastSosEventAt = ts;
     }
-  }
-);
 
-// --- GARMIN IPC OUTBOUND ENDPOINT ------------------------------------
-// This is the URL you gave Garmin as the IPC outbound webhook
-// e.g. https://magnus-garmin-ecc.onrender.com/garmin/ipc-outbound
+    this.devices.set(imei, dev);
+    return dev;
+  }
+
+  addOutboundMessage(imei, text, isSos) {
+    const dev = this._ensureDevice(imei);
+    const nowIso = new Date().toISOString();
+    dev.messages.push({
+      direction: "outbound",
+      text: text || "",
+      is_sos: !!isSos,
+      timestamp: nowIso,
+    });
+    if (dev.messages.length > 500) {
+      dev.messages.shift();
+    }
+    dev.lastMessageAt = nowIso;
+    this.devices.set(imei, dev);
+    return dev;
+  }
+
+  setSosClearedByImei(imei) {
+    const dev = this._ensureDevice(imei);
+    dev.isActiveSos = false;
+    dev.lastSosAckAt = new Date().toISOString();
+    this.devices.set(imei, dev);
+  }
+
+  getAll() {
+    return Array.from(this.devices.values());
+  }
+
+  get(imei) {
+    if (!imei) return null;
+    return this.devices.get(imei) || null;
+  }
+}
+
+const devicesStore = new DevicesStore();
+
+// --- IPC OUTBOUND (GARMIN -> US) ------------------------------------
+// URL you gave Garmin: https://magnus-garmin-ecc.onrender.com/garmin/ipc-outbound
 
 app.post(
   "/garmin/ipc-outbound",
@@ -423,23 +279,234 @@ app.post(
         JSON.stringify(body, null, 2)
       );
 
-      const events = (body && body.Events) || [];
-      if (Array.isArray(events)) {
-        events.forEach((evt) => {
-          devicesStore.upsertFromIpcEvent(evt);
+      if (body && Array.isArray(body.Events)) {
+        body.Events.forEach((ev) => {
+          devicesStore.upsertFromIpcEvent(ev);
         });
+        console.log(
+          `[DevicesStore] After IPC, total devices: ${devicesStore.getAll().length}`
+        );
+      } else {
+        console.log("[GarminOutbound] No Events array in payload");
       }
 
-      console.log(
-        "[DevicesStore] After IPC, total devices:",
-        devicesStore.listSummaries().length
-      );
-
-      // Always respond quickly to Garmin
+      // Always respond quickly
       res.status(200).json({ ok: true });
     } catch (err) {
       console.error("[GarminOutbound] Handler error:", err);
       res.status(500).json({ error: "Internal server error" });
+    }
+  }
+);
+
+// --- IPC INBOUND HELPER (US -> GARMIN) -------------------------------
+
+// NOTE: You MUST cross-check this with:
+// https://explore.garmin.com/IPCInbound/docs/
+// The structure below is a best-effort template and may need
+// small tweaks (field names / path) based on the official docs.
+
+async function callIpcInboundMessaging(endpointPath, payload) {
+  const url = `${IPC_INBOUND_BASE_URL}${endpointPath}`;
+  console.log("[IPCInbound] POST", url, "payload:", payload);
+
+  const res = await fetch(url, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json; charset=utf-8",
+    },
+    body: JSON.stringify(payload),
+  });
+
+  const text = await res.text();
+  let data = null;
+  try {
+    data = text ? JSON.parse(text) : null;
+  } catch (e) {
+    data = { raw: text };
+  }
+
+  if (!res.ok) {
+    console.error(
+      "[IPCInbound] Error response",
+      res.status,
+      res.statusText,
+      data
+    );
+    throw new Error(
+      `IPCInbound ${endpointPath} failed: ${res.status} ${res.statusText}`
+    );
+  }
+
+  console.log("[IPCInbound] OK response", data);
+  return data;
+}
+
+// --- FRONTEND API ROUTES (ECC UI) ------------------------------------
+
+// List all devices (used by ECC sidebar + map)
+app.get("/api/garmin/devices", authenticateApiKey, async (req, res) => {
+  try {
+    const list = devicesStore.getAll();
+    res.json(list);
+  } catch (err) {
+    console.error("[/api/garmin/devices] Error:", err);
+    res.status(500).json({ error: "Failed to fetch devices" });
+  }
+});
+
+// Map devices - for now same as list, but you could shape differently
+app.get(
+  "/api/garmin/map/devices",
+  authenticateApiKey,
+  async (req, res) => {
+    try {
+      const list = devicesStore.getAll();
+      res.json(list);
+    } catch (err) {
+      console.error("[/api/garmin/map/devices] Error:", err);
+      res.status(500).json({ error: "Failed to fetch map devices" });
+    }
+  }
+);
+
+// Device detail (used for chat + locations tab)
+app.get(
+  "/api/garmin/devices/:imei",
+  authenticateApiKey,
+  async (req, res) => {
+    try {
+      const { imei } = req.params;
+      const device = devicesStore.get(imei);
+      if (!device) {
+        return res.status(404).json({ error: "Device not found" });
+      }
+      res.json({ device });
+    } catch (err) {
+      console.error("[GET /api/garmin/devices/:imei] Error:", err);
+      res.status(500).json({ error: "Failed to fetch device detail" });
+    }
+  }
+);
+
+// Send a normal message to device via IPC Inbound Messaging
+app.post(
+  "/api/garmin/devices/:imei/message",
+  authenticateApiKey,
+  async (req, res) => {
+    try {
+      const { imei } = req.params;
+      const { text } = req.body || {};
+
+      if (!text || !text.trim()) {
+        return res
+          .status(400)
+          .json({ error: "Message text is required" });
+      }
+
+      // --- IMPORTANT ---
+      // Check Garmin docs for exact JSON and endpoint path.
+      // This is a template that you can adjust:
+      //
+      //   POST https://eur-enterprise.inreach.garmin.com/IPCInbound/V1/Messaging.svc/Message
+      //
+      // Example (hypothetical) body:
+      // {
+      //   "Username": "...",
+      //   "Password": "...",
+      //   "Message": {
+      //     "Imei": "3014...",
+      //     "Text": "Hello from MAGNUS",
+      //     "SendToInbox": true
+      //   }
+      // }
+      //
+      // Replace endpointPath and fields below as required.
+
+      const endpointPath = "/IPCInbound/V1/Messaging.svc/Message";
+
+      const payload = {
+        Username: IPC_INBOUND_USERNAME,
+        Password: IPC_INBOUND_PASSWORD,
+        Message: {
+          Imei: imei,
+          Text: text,
+          SendToInbox: true,
+        },
+      };
+
+      const inboundResponse = await callIpcInboundMessaging(
+        endpointPath,
+        payload
+      );
+
+      // Record outbound message in local store so chat view updates
+      const deviceAfter = devicesStore.addOutboundMessage(
+        imei,
+        text,
+        false
+      );
+
+      res.json({
+        ok: true,
+        inboundResponse,
+        device: deviceAfter,
+      });
+    } catch (err) {
+      console.error("[POST /api/garmin/devices/:imei/message] Error:", err);
+      res.status(500).json({ error: "Failed to send message" });
+    }
+  }
+);
+
+// Request locate – template/proxy, wired from ECC but may need tweaks
+app.post(
+  "/api/garmin/devices/:imei/locate",
+  authenticateApiKey,
+  async (req, res) => {
+    try {
+      const { imei } = req.params;
+
+      // Template – adjust according to Messaging docs if needed
+      const endpointPath = "/IPCInbound/V1/Messaging.svc/Locate";
+      const payload = {
+        Username: IPC_INBOUND_USERNAME,
+        Password: IPC_INBOUND_PASSWORD,
+        Imei: imei,
+      };
+
+      const inboundResponse = await callIpcInboundMessaging(
+        endpointPath,
+        payload
+      );
+
+      res.json({ ok: true, inboundResponse });
+    } catch (err) {
+      console.error("[POST /api/garmin/devices/:imei/locate] Error:", err);
+      res.status(500).json({ error: "Failed to send locate request" });
+    }
+  }
+);
+
+// SOS ACK – requires EmergencyId; not fully wired yet.
+// For now we just mark SOS cleared in local store.
+app.post(
+  "/api/garmin/devices/:imei/ack-sos",
+  authenticateApiKey,
+  async (req, res) => {
+    try {
+      const { imei } = req.params;
+
+      // TODO: If you decide to use Emergency.svc Acknowledge/Close,
+      // you'll need an EmergencyId from Garmin to send here.
+      // For now we only clear local flag so UI hides the red banner.
+
+      devicesStore.setSosClearedByImei(imei);
+      const device = devicesStore.get(imei);
+      res.json({ ok: true, device, note: "Local-only SOS clear" });
+    } catch (err) {
+      console.error("[POST /api/garmin/devices/:imei/ack-sos] Error:", err);
+      res.status(500).json({ error: "Failed to acknowledge SOS" });
     }
   }
 );
