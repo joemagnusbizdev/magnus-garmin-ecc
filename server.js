@@ -433,6 +433,8 @@ async function callIpcInboundMessaging({ imei, text }) {
 
 // --- IN-MEMORY DEVICES STORE ----------------------------------------
 
+// --- IN-MEMORY DEVICES STORE ----------------------------------------
+
 class DevicesStore {
   constructor() {
     this.devices = new Map();
@@ -485,7 +487,7 @@ class DevicesStore {
 
     const device = this.getOrCreate(imei);
 
-    // Timestamp
+    // --- Timestamp ---
     let tsMs =
       typeof evt.timeStamp !== "undefined"
         ? evt.timeStamp
@@ -494,13 +496,13 @@ class DevicesStore {
     if (typeof tsMs === "number" && tsMs > 0) {
       ts = new Date(tsMs);
     } else {
-      // Sometimes Garmin sends weird timestamps; fall back to now
+      // Garmin sometimes sends weird timestamps (e.g. virtual test)
       ts = new Date();
     }
     const tsIso = ts.toISOString();
     device.lastEventAt = tsIso;
 
-    // Position
+    // --- Position ---
     const point = evt.point || evt.Point || {};
     const lat =
       typeof point.latitude !== "undefined"
@@ -552,60 +554,102 @@ class DevicesStore {
       }
     }
 
-    // Message / SOS logic
-const messageCode =
-  typeof evt.messageCode !== "undefined"
-    ? evt.messageCode
-    : evt.MessageCode;
+    // --- Message / SOS logic with heuristics ---
+    const messageCode =
+      typeof evt.messageCode !== "undefined"
+        ? evt.messageCode
+        : evt.MessageCode;
 
-const freeTextRaw = evt.freeText || evt.FreeText || "";
-const freeText = String(freeTextRaw || "").trim();
+    const freeTextRaw = evt.freeText || evt.FreeText || "";
+    const freeText = String(freeTextRaw || "").trim();
 
-// Garmin tracking-only ping (code 6, no text)
-const isTrackingOnly =
-  messageCode === 6 && !freeText;
+    // Tracking-only ping (code 6, no text)
+    const isTrackingOnly =
+      messageCode === 6 && !freeText;
 
-// Heuristics for SOS:
-// 1) Official SOS event (messageCode === 7)
-// 2) Emergency ID present
-// 3) Text that starts with "SOS" (e.g. "SOS: Help...").
-const emergencyId =
-  evt.emergencyId || evt.EmergencyId || null;
+    const emergencyId =
+      evt.emergencyId || evt.EmergencyId || null;
 
-const looksLikeSosText =
-  freeText.length > 0 &&
-  freeText.toUpperCase().startsWith("SOS");
+    const looksLikeSosText =
+      freeText.length > 0 &&
+      freeText.toUpperCase().startsWith("SOS");
 
-const isSosEvent =
-  messageCode === 7 || !!emergencyId || looksLikeSosText;
+    const isSosEvent =
+      messageCode === 7 || !!emergencyId || looksLikeSosText;
 
-if (isSosEvent) {
-  device.isActiveSos = true;
-  device.status = "open";
-  device.lastSosEventAt = tsIso;
+    if (isSosEvent) {
+      device.isActiveSos = true;
+      device.status = "open";
+      device.lastSosEventAt = tsIso;
 
-  device.messages.push({
-    id: "sos-" + ts.getTime(),
-    direction: "inbound",
-    text: freeText || "SOS activated",
-    is_sos: true,
-    timestamp: tsIso,
-  });
-  device.lastMessageAt = tsIso;
-} else if (!isTrackingOnly && freeText.length > 0) {
-  device.messages.push({
-    id: "in-" + ts.getTime(),
-    direction: "inbound",
-    text: freeText,
-    is_sos: false,
-    timestamp: tsIso,
-  });
-  device.lastMessageAt = tsIso;
+      device.messages.push({
+        id: "sos-" + ts.getTime(),
+        direction: "inbound",
+        text: freeText || "SOS activated",
+        is_sos: true,
+        timestamp: tsIso,
+      });
+      device.lastMessageAt = tsIso;
+
+      console.log("[DevicesStore] SOS detected for IMEI", imei, {
+        messageCode,
+        emergencyId,
+        freeText,
+      });
+    } else if (!isTrackingOnly && freeText.length > 0) {
+      device.messages.push({
+        id: "in-" + ts.getTime(),
+        direction: "inbound",
+        text: freeText,
+        is_sos: false,
+        timestamp: tsIso,
+      });
+      device.lastMessageAt = tsIso;
+    }
+
+    this.devices.set(imei, device);
+  }
+
+  addOutboundMessage(imei, { text, is_sos }) {
+    const device = this.getOrCreate(imei);
+    const tsIso = new Date().toISOString();
+    device.messages.push({
+      id: "out-" + Date.now(),
+      direction: "outbound",
+      text,
+      is_sos: !!is_sos,
+      timestamp: tsIso,
+    });
+    device.lastMessageAt = tsIso;
+    this.devices.set(imei, device);
+    return device;
+  }
+
+  ackSos(imei) {
+    const device = this.devices.get(imei);
+    if (!device) return null;
+    device.isActiveSos = false;
+    device.lastSosAckAt = new Date().toISOString();
+    this.devices.set(imei, device);
+    return device;
+  }
+
+  getAllDevices() {
+    return Array.from(this.devices.values());
+  }
+
+  getDeviceDetail(imei) {
+    const device = this.devices.get(imei);
+    if (!device) return null;
+    return {
+      device,
+      positions: device.positions,
+      messages: device.messages,
+    };
+  }
 }
 
-this.devices.set(imei, device);
-
-
+const devicesStore = new DevicesStore();
 // --- HEALTHCHECK -----------------------------------------------------
 
 app.head("/", (req, res) => {
