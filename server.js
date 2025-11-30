@@ -64,6 +64,8 @@ const TENANTS = {
 const ACTIVE_TENANT_ID =
   process.env.ACTIVE_TENANT_ID || "satdesk22";
 
+// --- IPC INBOUND REST (Messaging /Message) -----------------------------
+
 function getActiveTenant() {
   const tenant = TENANTS[ACTIVE_TENANT_ID];
   if (!tenant) {
@@ -74,6 +76,92 @@ function getActiveTenant() {
     );
   }
   return tenant;
+}
+
+/**
+ * Send a normal text message via IPC Inbound REST /Message
+ * Docs: POST /Message with Messages[ { Recipients, Sender, Timestamp, Message } ]
+ */
+async function callIpcInboundRestMessage({ imei, text }) {
+  const tenant = getActiveTenant();
+  if (!tenant || !tenant.rest || !tenant.rest.enabled) {
+    console.warn(
+      "[IPCInbound REST] REST not enabled for tenant – skipping outbound send"
+    );
+    return { skipped: true, reason: "rest-disabled" };
+  }
+
+  const baseUrl = (tenant.rest.baseUrl || "").replace(/\/+$/, "");
+  const apiKey = tenant.rest.apiKey;
+
+  if (!baseUrl || !apiKey) {
+    console.warn("[IPCInbound REST] Missing baseUrl or apiKey – skipping send");
+    return { skipped: true, reason: "missing-credentials" };
+  }
+
+  const url = baseUrl + "/Message";
+
+  // Garmin wants /Date(ms)/ JSON timestamp
+  const nowMs = Date.now();
+  const jsonDate = `\\/Date(${nowMs})\\/`;
+
+  const sender =
+    tenant.rest.senderEmail ||
+    tenant.rest.sender ||
+    "ops@magnus.co.il"; // fallback – can tweak
+
+  const payload = {
+    Messages: [
+      {
+        Recipients: [imei],
+        Sender: sender,
+        Timestamp: jsonDate,
+        Message: text,
+      },
+    ],
+  };
+
+  console.log("[IPCInbound REST] POST", url, "payload:", payload);
+
+  const res = await fetch(url, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "X-API-Key": apiKey,
+    },
+    body: JSON.stringify(payload),
+  });
+
+  const rawBody = await res.text();
+  let data = null;
+  try {
+    data = JSON.parse(rawBody);
+  } catch (_) {
+    // not JSON, ignore
+  }
+
+  if (!res.ok) {
+    console.error(
+      "[IPCInbound REST] HTTP error",
+      res.status,
+      res.statusText,
+      rawBody
+    );
+
+    const garminCode = data && data.Code;
+    const garminMsg = data && data.Message;
+    const garminDesc = data && data.Description;
+
+    throw new Error(
+      `IPCInbound REST /Message failed: ${res.status} ${res.statusText}` +
+        (garminCode != null
+          ? ` (Code ${garminCode}: ${garminMsg || ""} - ${garminDesc || ""})`
+          : ` – Body: ${rawBody}`)
+    );
+  }
+
+  console.log("[IPCInbound REST] Message sent OK:", data);
+  return data;
 }
 
 // --- MIDDLEWARE ------------------------------------------------------
@@ -610,22 +698,23 @@ app.post(
         is_sos: !!is_sos,
       });
 
-      try {
-        const result = await callIpcInboundMessaging({
-          imei,
-          text: is_sos ? "SOS: " + text : text,
-        });
-        res.json({ ok: true, gateway: result });
-      } catch (gatewayErr) {
-        console.error(
-          "[POST /message] IPCInbound error:",
-          gatewayErr.message
-        );
-        res.status(500).json({
-          error: "Gateway send failed",
-          detail: gatewayErr.message,
-        });
-      }
+       try {
+    const result = await callIpcInboundRestMessage({
+      imei,
+      text: is_sos ? "SOS: " + text : text,
+    });
+    res.json({ ok: true, gateway: result });
+  } catch (err) {
+    console.error(
+      "[POST /message] IPCInbound REST error:",
+      err.message
+    );
+    res.status(500).json({
+      error: "Gateway send failed",
+      detail: err.message,
+    });
+  }
+
     } catch (err) {
       console.error(
         "[POST /api/garmin/devices/:imei/message] Error:",
@@ -705,7 +794,7 @@ app.post(
       console.log("HEADERS FROM GARMIN:", {
         host: headers.host,
         "user-agent": headers["user-agent"],
-        "content-length": headers["content-length"],
+        "content-length": headers["contf=ent-length"],
         "content-type": headers["content-type"],
         "x-outbound-auth-token": headers["x-outbound-auth-token"],
         "correlation-context": headers["correlation-context"],
