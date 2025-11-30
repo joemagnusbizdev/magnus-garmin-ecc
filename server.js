@@ -235,6 +235,15 @@ function authenticateGarminOutbound(req, res, next) {
   console.log("[GarminOutbound] Auth OK");
   return next();
 }
+app.get("/debug/tenant", (req, res) => {
+  const tenant = getActiveTenant();
+  res.json({
+    ACTIVE_TENANT_ID: process.env.ACTIVE_TENANT_ID,
+    restEnabled: tenant?.restEnabled ?? null,
+    restBaseUrl: tenant?.restBaseUrl ?? null,
+    restApiKeyPresent: !!tenant?.restApiKey,
+  });
+});
 
 // --- IPC INBOUND (GARMIN REST + SOAP) -------------------------------
 
