@@ -24,17 +24,80 @@ const INTERNAL_API_KEY =
   process.env.INTERNAL_API_KEY || "MAGNUS302010!";
 
 // Garmin outbound auth token for /garmin/ipc-outbound
-const GARMIN_OUTBOUND_AUTH_TOKEN =
-  process.env.GARMIN_OUTBOUND_AUTH_TOKEN || "";
+// Must match the token configured in Garmin Portal Connect (Outbound)
+const GARMIN_OUTBOUND_TOKEN =
+  process.env.GARMIN_OUTBOUND_TOKEN || "";
 
-// IPCInbound (sending messages / later tracking / emergency)
-const IPC_INBOUND_BASE_URL =
-  process.env.IPC_INBOUND_BASE_URL ||
-  "https://eur-enterprise.inreach.garmin.com/IPCInbound/V1";
-const IPC_INBOUND_USERNAME =
-  process.env.IPC_INBOUND_USERNAME || "";
-const IPC_INBOUND_PASSWORD =
-  process.env.IPC_INBOUND_PASSWORD || "";
+// DEFAULT (single-tenant style) IPC REST settings
+const DEFAULT_INBOUND_BASE_URL =
+  process.env.INBOUND_BASE_URL ||
+  "https://ipcinbound.inreachapp.com/api";
+const DEFAULT_INBOUND_USERNAME =
+  process.env.INBOUND_USERNAME || "";
+const DEFAULT_INBOUND_PASSWORD =
+  process.env.INBOUND_PASSWORD || "";
+const DEFAULT_IPC_API_KEY =
+  process.env.GARMIN_IPC_API_KEY || "";
+
+// --- MULTI-TENANT SETUP ---------------------------------------------
+// For now, only satdesk22 is “real”, but this structure lets you add
+// satdesk1–9,11–17,19–24 easily later.
+
+const TENANTS = {
+  satdesk22: {
+    id: "satdesk22",
+
+    // REST base URL + API key (REST IPC Inbound)
+    ipcRestBaseUrl:
+      process.env.SATDESK22_INBOUND_BASE_URL ||
+      DEFAULT_INBOUND_BASE_URL,
+    ipcRestApiKey:
+      process.env.SATDESK22_IPC_API_KEY ||
+      DEFAULT_IPC_API_KEY,
+
+    // Optional: keep username/password for reference or future SOAP use
+    ipcUsername:
+      process.env.SATDESK22_INBOUND_USERNAME ||
+      DEFAULT_INBOUND_USERNAME,
+    ipcPassword:
+      process.env.SATDESK22_INBOUND_PASSWORD ||
+      DEFAULT_INBOUND_PASSWORD,
+  },
+
+  // 🔽 When Garmin activates other satdesks, copy this pattern:
+  //
+  // satdesk01: {
+  //   id: "satdesk01",
+  //   ipcRestBaseUrl:
+  //     process.env.SATDESK01_INBOUND_BASE_URL ||
+  //     DEFAULT_INBOUND_BASE_URL,
+  //   ipcRestApiKey:
+  //     process.env.SATDESK01_IPC_API_KEY ||
+  //     DEFAULT_IPC_API_KEY,
+  //   ipcUsername:
+  //     process.env.SATDESK01_INBOUND_USERNAME ||
+  //     DEFAULT_INBOUND_USERNAME,
+  //   ipcPassword:
+  //     process.env.SATDESK01_INBOUND_PASSWORD ||
+  //     DEFAULT_INBOUND_PASSWORD,
+  // },
+};
+
+// For now we use satdesk22 as the active tenant
+const ACTIVE_TENANT_ID =
+  process.env.ACTIVE_TENANT_ID || "satdesk22";
+
+function getActiveTenant() {
+  const tenant = TENANTS[ACTIVE_TENANT_ID];
+  if (!tenant) {
+    console.warn(
+      "[Tenant] ACTIVE_TENANT_ID",
+      ACTIVE_TENANT_ID,
+      "has no config – outbound sends will be skipped"
+    );
+  }
+  return tenant;
+}
 
 // --- MIDDLEWARE ------------------------------------------------------
 
@@ -55,7 +118,7 @@ app.use(
 app.use(express.json({ limit: "5mb" }));
 app.use(morgan("combined"));
 
-// --- HELPERS ---------------------------------------------------------
+// --- HELPERS: AUTH ---------------------------------------------------
 
 function authenticateApiKey(req, res, next) {
   if (!INTERNAL_API_KEY) {
@@ -91,14 +154,14 @@ function authenticateGarminOutbound(req, res, next) {
     return res.status(401).json({ error: "Unauthorized" });
   }
 
-  if (!GARMIN_OUTBOUND_AUTH_TOKEN) {
+  if (!GARMIN_OUTBOUND_TOKEN) {
     console.log(
-      "[GarminOutbound] ERROR: GARMIN_OUTBOUND_AUTH_TOKEN not set"
+      "[GarminOutbound] ERROR: GARMIN_OUTBOUND_TOKEN not set"
     );
     return res.status(500).json({ error: "Server misconfigured" });
   }
 
-  if (token !== GARMIN_OUTBOUND_AUTH_TOKEN) {
+  if (token !== GARMIN_OUTBOUND_TOKEN) {
     console.log("[GarminOutbound] Invalid token received:", token);
     return res.status(401).json({ error: "Unauthorized" });
   }
@@ -107,32 +170,45 @@ function authenticateGarminOutbound(req, res, next) {
   return next();
 }
 
-function buildIpcInboundUrl(path) {
-  return IPC_INBOUND_BASE_URL.replace(/\/+$/, "") + path;
-}
+// --- IPC INBOUND (REST) ---------------------------------------------
+// Send outbound messages from ECC → Garmin via REST.
+//
+// Docs are a little opaque so we:
+//  * log tenant config
+//  * log URL + payload
+// so we can see what Garmin returns in Render logs.
 
-/**
- * Call IPCInbound Messaging.svc/Message
- * NOTE: This will only succeed once Garmin confirms username/password.
- */
 async function callIpcInboundMessaging({ imei, text }) {
-  if (!IPC_INBOUND_USERNAME || !IPC_INBOUND_PASSWORD) {
+  const tenant = getActiveTenant();
+
+  console.log("[IPCInbound] Tenant config for send:", {
+    tenantId: ACTIVE_TENANT_ID,
+    baseUrl: tenant && tenant.ipcRestBaseUrl,
+    apiKeyPresent: !!(tenant && tenant.ipcRestApiKey),
+    usernamePresent: !!(tenant && tenant.ipcUsername),
+    passwordPresent: !!(tenant && tenant.ipcPassword),
+  });
+
+  if (
+    !tenant ||
+    !tenant.ipcRestBaseUrl ||
+    !tenant.ipcRestApiKey
+  ) {
     console.warn(
-      "[IPCInbound] Username/password not set – skipping outbound send"
+      "[IPCInbound] Missing REST credentials – skipping outbound send"
     );
-    // We don't throw here, we just no-op; ECC stays usable
     return { skipped: true, reason: "missing-credentials" };
   }
 
-  const url = buildIpcInboundUrl("/Messaging.svc/Message");
+  const url =
+    tenant.ipcRestBaseUrl.replace(/\/+$/, "") + "/Message";
+
+  // ⚠️ Payload shape may need tweaking to match Garmin’s REST spec.
   const payload = {
-    Username: IPC_INBOUND_USERNAME,
-    Password: IPC_INBOUND_PASSWORD,
-    Message: {
-      Imei: imei,
-      Text: text,
-      SendToInbox: true,
-    },
+    ApiKey: tenant.ipcRestApiKey,
+    Imei: imei,
+    MessageText: text,
+    SendToInbox: true,
   };
 
   console.log("[IPCInbound] POST", url, "payload:", payload);
@@ -143,12 +219,12 @@ async function callIpcInboundMessaging({ imei, text }) {
     body: JSON.stringify(payload),
   });
 
-  const textBody = await res.text();
+  const raw = await res.text();
   let data = null;
   try {
-    data = JSON.parse(textBody);
-  } catch (_) {
-    // Not JSON, ignore
+    data = JSON.parse(raw);
+  } catch {
+    console.warn("[IPCInbound] Non-JSON response body:", raw);
   }
 
   if (!res.ok) {
@@ -156,25 +232,21 @@ async function callIpcInboundMessaging({ imei, text }) {
       "[IPCInbound] HTTP error",
       res.status,
       res.statusText,
-      data || textBody
+      data || raw
     );
     throw new Error(
-      `IPCInbound /Messaging.svc/Message failed: ${res.status} ${
-        (data && data.Message) || res.statusText
+      `IPCInbound REST /Message failed: ${res.status} ${
+        (data && (data.Message || data.Error)) ||
+        res.statusText
       }`
     );
   }
 
-  // Garmin typically returns { Code: 0, Message: "...", ... } on success
-  if (data && typeof data.Code !== "undefined" && data.Code !== 0) {
-    console.error("[IPCInbound] Logical error response:", data);
-    throw new Error(
-      `IPCInbound /Messaging.svc/Message failed: Code=${data.Code} ${data.Message}`
-    );
-  }
-
-  console.log("[IPCInbound] Message sent OK", { imei });
-  return data;
+  console.log("[IPCInbound] REST send OK", {
+    imei,
+    data: data || raw,
+  });
+  return data || { ok: true };
 }
 
 // --- IN-MEMORY DEVICES STORE ----------------------------------------
@@ -191,12 +263,15 @@ class DevicesStore {
         label: imei,
         status: "open",
         isActiveSos: false,
+        trackingEnabled: false,
+
         lastPosition: null,
         lastPositionAt: null,
         lastMessageAt: null,
         lastEventAt: null,
         lastSosEventAt: null,
         lastSosAckAt: null,
+
         messages: [],
         positions: [],
       });
@@ -359,6 +434,13 @@ class DevicesStore {
     return device;
   }
 
+  setTrackingEnabled(imei, enabled) {
+    const device = this.getOrCreate(imei);
+    device.trackingEnabled = !!enabled;
+    this.devices.set(imei, device);
+    return device;
+  }
+
   getAllDevices() {
     return Array.from(this.devices.values());
   }
@@ -434,7 +516,7 @@ app.get(
   }
 );
 
-// Send a message to device (and via IPCInbound if creds OK)
+// Send a message to device (and via IPCInbound REST if creds OK)
 app.post(
   "/api/garmin/devices/:imei/message",
   authenticateApiKey,
@@ -448,18 +530,20 @@ app.post(
         .json({ error: "Message text is required" });
     }
 
+    const finalText = is_sos ? "SOS: " + text : text;
+
     try {
       // Store outbound in ECC history
       devicesStore.addOutboundMessage(imei, {
-        text: is_sos ? "SOS: " + text : text,
+        text: finalText,
         is_sos: !!is_sos,
       });
 
-      // Try to send via IPCInbound
+      // Try to send via IPCInbound REST
       try {
         const result = await callIpcInboundMessaging({
           imei,
-          text: is_sos ? "SOS: " + text : text,
+          text: finalText,
         });
         res.json({ ok: true, gateway: result });
       } catch (err) {
@@ -502,9 +586,6 @@ app.post(
         is_sos: true,
       });
 
-      // TODO: If you later use Emergency.svc Acknowledge/Close,
-      // you will need an EmergencyId from Garmin to send here.
-
       res.json({ ok: true, device });
     } catch (err) {
       console.error(
@@ -527,7 +608,6 @@ app.post(
         "[LOCATE] Requested manual location for",
         imei
       );
-      // In future you can wire this to a specific IPCInbound endpoint.
       res.json({
         ok: true,
         note:
@@ -536,6 +616,37 @@ app.post(
     } catch (err) {
       console.error(
         "[POST /api/garmin/devices/:imei/locate] Error:",
+        err
+      );
+      res.status(500).json({ error: "Internal server error" });
+    }
+  }
+);
+
+// Tracking toggle (local flag only for now)
+app.post(
+  "/api/garmin/devices/:imei/tracking",
+  authenticateApiKey,
+  async (req, res) => {
+    try {
+      const imei = req.params.imei;
+      const { enabled } = req.body || {};
+
+      if (typeof enabled !== "boolean") {
+        return res.status(400).json({
+          error: "'enabled' boolean is required",
+        });
+      }
+
+      const device =
+        devicesStore.setTrackingEnabled(imei, enabled);
+      res.json({
+        ok: true,
+        trackingEnabled: device.trackingEnabled,
+      });
+    } catch (err) {
+      console.error(
+        "[POST /api/garmin/devices/:imei/tracking] Error:",
         err
       );
       res.status(500).json({ error: "Internal server error" });
@@ -558,8 +669,10 @@ app.post(
         "user-agent": headers["user-agent"],
         "content-length": headers["content-length"],
         "content-type": headers["content-type"],
-        "x-outbound-auth-token": headers["x-outbound-auth-token"],
-        "correlation-context": headers["correlation-context"],
+        "x-outbound-auth-token":
+          headers["x-outbound-auth-token"],
+        "correlation-context":
+          headers["correlation-context"],
         "cf-connecting-ip": headers["cf-connecting-ip"],
         "x-forwarded-for": headers["x-forwarded-for"],
       });
