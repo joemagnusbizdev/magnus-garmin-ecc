@@ -5,12 +5,15 @@ const express = require("express");
 const cors = require("cors");
 const morgan = require("morgan");
 
-// --- CONFIG ----------------------------------------------------------
+// --- BASIC CONFIG ----------------------------------------------------
 
 const app = express();
 const PORT = process.env.PORT || 10000;
 
-// Allowed frontend origins
+// Frontend auth key (ECC UI -> this backend)
+const INTERNAL_API_KEY = process.env.INTERNAL_API_KEY || "MAGNUS302010!";
+
+// CORS whitelist
 const ALLOWED_ORIGINS = (
   process.env.ALLOWED_ORIGINS ||
   "https://blog.magnusafety.com,https://magnusafety.com,http://localhost:3000"
@@ -19,53 +22,47 @@ const ALLOWED_ORIGINS = (
   .map((o) => o.trim())
   .filter(Boolean);
 
-// Simple API key for ECC frontend calls
-const INTERNAL_API_KEY =
-  process.env.INTERNAL_API_KEY || "MAGNUS302010!";
-
-// Garmin outbound auth token for /garmin/ipc-outbound
+// Outbound token (Garmin → this backend, IPC outbound webhook)
 const GARMIN_OUTBOUND_AUTH_TOKEN =
   process.env.GARMIN_OUTBOUND_AUTH_TOKEN ||
   process.env.GARMIN_OUTBOUND_TOKEN ||
   "";
 
-// Optional SQLite DB path (not yet used, but reserved)
-const DB_FILE = process.env.DB_FILE || "garmin.db";
-
-// --- MULTI-TENANT GARMIN CONFIG -------------------------------------
-// Right now only satdesk22 is active, but this is ready for more.
+// --- TENANTS (MULTI-ACCOUNT) ----------------------------------------
+// We start with just satdesk22 but structure is ready for more.
 
 const TENANTS = {
   satdesk22: {
     id: "satdesk22",
 
-    // Legacy SOAP-style IPCInbound (if you ever want it again)
-    ipcSoapBaseUrl:
+    // SOAP (legacy) – only used as fallback when REST not configured
+    soapBaseUrl:
       process.env.SATDESK22_INBOUND_BASE_URL ||
+      process.env.IPC_INBOUND_BASE_URL ||
       "https://eur-enterprise.inreach.garmin.com/IPCInbound/V1",
-    ipcSoapUsername:
+    soapUsername:
       process.env.SATDESK22_INBOUND_USERNAME ||
-      process.env.IPC_EU_USERNAME ||
+      process.env.IPC_INBOUND_USERNAME ||
       "",
-    ipcSoapPassword:
+    soapPassword:
       process.env.SATDESK22_INBOUND_PASSWORD ||
-      process.env.IPC_EU_PASSWORD ||
+      process.env.IPC_INBOUND_PASSWORD ||
       "",
 
-    // NEW REST IPCInbound
-    ipcRestBaseUrl:
+    // REST (modern, what we want to use now)
+    restBaseUrl:
       process.env.SATDESK22_REST_BASE_URL ||
       "https://ipcinbound.inreachapp.com/api",
-    ipcRestApiKey: process.env.SATDESK22_REST_API_KEY || "",
+    restApiKey: process.env.SATDESK22_REST_API_KEY || "",
 
-    // Toggle REST on/off
-    restEnabled:
-      String(process.env.SATDESK22_REST_ENABLED || "true")
-        .toLowerCase() === "true",
+    // Future: you could have per-tenant outbound token if needed
+    outboundToken: GARMIN_OUTBOUND_AUTH_TOKEN,
   },
 };
 
-const ACTIVE_TENANT_ID = process.env.ACTIVE_TENANT_ID || "satdesk22";
+// Which tenant is “live” for outbound sends right now
+const ACTIVE_TENANT_ID =
+  process.env.ACTIVE_TENANT_ID || "satdesk22";
 
 function getActiveTenant() {
   const tenant = TENANTS[ACTIVE_TENANT_ID];
@@ -75,8 +72,6 @@ function getActiveTenant() {
       ACTIVE_TENANT_ID,
       "has no config – outbound sends will be skipped"
     );
-  } else {
-    console.log("[Tenant] Using tenant:", ACTIVE_TENANT_ID);
   }
   return tenant;
 }
@@ -88,7 +83,6 @@ app.set("trust proxy", true);
 app.use(
   cors({
     origin(origin, callback) {
-      // allow curl/postman (no origin) and whitelisted frontends
       if (!origin || ALLOWED_ORIGINS.includes(origin)) {
         return callback(null, true);
       }
@@ -100,7 +94,7 @@ app.use(
 app.use(express.json({ limit: "5mb" }));
 app.use(morgan("combined"));
 
-// --- HELPERS: AUTH ---------------------------------------------------
+// --- HELPERS: FRONTEND AUTH -----------------------------------------
 
 function authenticateApiKey(req, res, next) {
   if (!INTERNAL_API_KEY) {
@@ -128,6 +122,8 @@ function authenticateApiKey(req, res, next) {
   return next();
 }
 
+// --- HELPERS: GARMIN OUTBOUND AUTH ----------------------------------
+
 function authenticateGarminOutbound(req, res, next) {
   const token = req.get("x-outbound-auth-token");
 
@@ -152,78 +148,190 @@ function authenticateGarminOutbound(req, res, next) {
   return next();
 }
 
-// --- IPCINBOUND REST CALL (ECC → GARMIN) -----------------------------
+// --- IPC INBOUND (GARMIN REST + SOAP) -------------------------------
 
 /**
- * Send a message to Garmin via IPCInbound REST.
- * Uses the active tenant's ipcRestBaseUrl + ipcRestApiKey.
+ * REST v2 – POST /Emergency/SendMessage
+ *
+ * From Garmin docs:
+ *   URL: https://ipcinbound.inreachapp.com/api/Emergency/SendMessage
+ *   Body:
+ *   {
+ *     "IMEI": "tenant-imei",
+ *     "UtcTimeStamp": "2024-04-07T21:28:24.968Z",
+ *     "Message": "Text..."
+ *   }
+ *   Header: x-api-key: <your IPC Inbound API key>
  */
-async function callIpcInboundMessaging({ imei, text }) {
-  const tenant = getActiveTenant();
-
-  if (!tenant) {
-    console.warn("[IPCInbound] No active tenant – outbound send skipped");
-    return { skipped: true, reason: "no-tenant" };
-  }
-
-  const restBase = tenant.ipcRestBaseUrl;
-  const apiKey = tenant.ipcRestApiKey;
-
-  console.log("[IPCInbound] Tenant config for send:", {
-    tenantId: tenant.id,
-    baseUrl: restBase,
-    apiKeyPresent: !!apiKey,
-    usernamePresent: !!tenant.ipcSoapUsername,
-    passwordPresent: !!tenant.ipcSoapPassword,
-  });
-
-  if (!tenant.restEnabled || !apiKey || !restBase) {
-    console.warn(
-      "[IPCInbound] Missing REST credentials – skipping outbound send"
-    );
-    return { skipped: true, reason: "missing-rest-credentials" };
-  }
-
-  const url = `${restBase.replace(/\/+$/, "")}/message`;
+async function callIpcInboundMessagingRest(tenant, { imei, text }) {
+  const base = (tenant.restBaseUrl || "").replace(/\/+$/, "");
+  const url = base + "/Emergency/SendMessage";
 
   const payload = {
-    Imei: imei,
+    IMEI: String(imei),
+    UtcTimeStamp: new Date().toISOString(),
     Message: text,
   };
 
-  console.log("[IPCInbound] REST POST", url, "payload:", payload);
+  console.log("[IPCInbound REST] POST", url, {
+    tenantId: tenant.id,
+    imei: payload.IMEI,
+    timestamp: payload.UtcTimeStamp,
+  });
 
   const res = await fetch(url, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
-      "x-api-key": apiKey,
+      Accept: "application/json",
+      "x-api-key": tenant.restApiKey,
     },
     body: JSON.stringify(payload),
   });
 
-  const rawText = await res.text();
-  let data;
+  const rawBody = await res.text();
+  let data = null;
   try {
-    data = JSON.parse(rawText);
-  } catch {
-    data = rawText;
+    data = rawBody ? JSON.parse(rawBody) : null;
+  } catch (_) {
+    // empty or non-JSON body on 200 is fine
   }
 
   if (!res.ok) {
     console.error(
-      "[IPCInbound] REST error",
+      "[IPCInbound REST] HTTP error",
       res.status,
       res.statusText,
-      data
+      data || rawBody
     );
     throw new Error(
-      `IPCInbound REST /message failed: ${res.status} ${res.statusText}`
+      `IPCInbound REST /Emergency/SendMessage failed: ${res.status} ${res.statusText}`
     );
   }
 
-  console.log("[IPCInbound] REST send OK:", data);
-  return data;
+  // Error payloads from Garmin use Code / Message etc.
+  if (data && typeof data.Code !== "undefined" && data.Code !== 0) {
+    console.error("[IPCInbound REST] Logical error:", data);
+    throw new Error(
+      `IPCInbound REST /Emergency/SendMessage failed: Code=${data.Code} ${data.Message}`
+    );
+  }
+
+  console.log("[IPCInbound REST] Message sent OK", {
+    imei,
+    status: res.status,
+  });
+
+  return {
+    ok: true,
+    mode: "rest",
+    httpStatus: res.status,
+    body: data,
+  };
+}
+
+/**
+ * SOAP-style JSON over /Messaging.svc/Message
+ * (legacy path, used only if REST isn't configured)
+ */
+async function callIpcInboundMessagingSoap(tenant, { imei, text }) {
+  if (!tenant.soapUsername || !tenant.soapPassword) {
+    console.warn(
+      "[IPCInbound SOAP] Username/password not set – skipping"
+    );
+    return { skipped: true, reason: "missing-soap-credentials" };
+  }
+
+  const base = (tenant.soapBaseUrl || "").replace(/\/+$/, "");
+  const url = base + "/Messaging.svc/Message";
+
+  const payload = {
+    Username: tenant.soapUsername,
+    Password: tenant.soapPassword,
+    Message: {
+      Imei: imei,
+      Text: text,
+      SendToInbox: true,
+    },
+  };
+
+  console.log("[IPCInbound SOAP] POST", url, {
+    tenantId: tenant.id,
+    imei,
+  });
+
+  const res = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+
+  const rawBody = await res.text();
+  let data = null;
+  try {
+    data = rawBody ? JSON.parse(rawBody) : null;
+  } catch (_) {}
+
+  if (!res.ok) {
+    console.error(
+      "[IPCInbound SOAP] HTTP error",
+      res.status,
+      res.statusText,
+      data || rawBody
+    );
+    throw new Error(
+      `IPCInbound SOAP /Messaging.svc/Message failed: ${res.status} ${res.statusText}`
+    );
+  }
+
+  if (data && typeof data.Code !== "undefined" && data.Code !== 0) {
+    console.error("[IPCInbound SOAP] Logical error:", data);
+    throw new Error(
+      `IPCInbound SOAP /Messaging.svc/Message failed: Code=${data.Code} ${data.Message}`
+    );
+  }
+
+  console.log("[IPCInbound SOAP] Message sent OK", { imei });
+  return { ok: true, mode: "soap", data };
+}
+
+/**
+ * Unified outbound send: prefer REST, fallback to SOAP, otherwise skip.
+ */
+async function callIpcInboundMessaging({ imei, text }) {
+  const tenant = getActiveTenant();
+  if (!tenant) {
+    console.warn("[IPCInbound] No active tenant – skipping send");
+    return { skipped: true, reason: "no-tenant" };
+  }
+
+  const hasRest = !!(tenant.restBaseUrl && tenant.restApiKey);
+  const hasSoap =
+    !!tenant.soapBaseUrl &&
+    !!tenant.soapUsername &&
+    !!tenant.soapPassword;
+
+  console.log("[IPCInbound] Tenant config for send:", {
+    tenantId: tenant.id,
+    baseUrl: tenant.restBaseUrl || tenant.soapBaseUrl,
+    restBaseUrl: tenant.restBaseUrl,
+    apiKeyPresent: !!tenant.restApiKey,
+    soapUsernamePresent: !!tenant.soapUsername,
+    soapPasswordPresent: !!tenant.soapPassword,
+  });
+
+  if (hasRest) {
+    return callIpcInboundMessagingRest(tenant, { imei, text });
+  }
+
+  if (hasSoap) {
+    return callIpcInboundMessagingSoap(tenant, { imei, text });
+  }
+
+  console.warn(
+    "[IPCInbound] Missing REST and SOAP credentials – skipping outbound send"
+  );
+  return { skipped: true, reason: "missing-credentials" };
 }
 
 // --- IN-MEMORY DEVICES STORE ----------------------------------------
@@ -289,7 +397,7 @@ class DevicesStore {
     if (typeof tsMs === "number" && tsMs > 0) {
       ts = new Date(tsMs);
     } else {
-      // Garmin sometimes sends weird timestamps (e.g. virtual test)
+      // Sometimes Garmin sends weird timestamps; fall back to now
       ts = new Date();
     }
     const tsIso = ts.toISOString();
@@ -437,12 +545,12 @@ app.get("/", (req, res) => {
     status: "ok",
     service: "MAGNUS Garmin ECC backend",
     time: new Date().toISOString(),
+    activeTenant: ACTIVE_TENANT_ID,
   });
 });
 
-// --- FRONTEND API ROUTES (ECC UI) -----------------------------------
+// --- FRONTEND API ROUTES --------------------------------------------
 
-// List all devices (flattened)
 app.get(
   "/api/garmin/devices",
   authenticateApiKey,
@@ -457,7 +565,6 @@ app.get(
   }
 );
 
-// Detailed view for a single device
 app.get(
   "/api/garmin/devices/:imei",
   authenticateApiKey,
@@ -483,7 +590,6 @@ app.get(
   }
 );
 
-// Send a message to device (and via IPCInbound REST if creds OK)
 app.post(
   "/api/garmin/devices/:imei/message",
   authenticateApiKey,
@@ -498,30 +604,26 @@ app.post(
     }
 
     try {
-      const outboundText = is_sos ? "SOS: " + text : text;
-
-      // Store outbound in ECC history
+      // store outbound in ECC history
       devicesStore.addOutboundMessage(imei, {
-        text: outboundText,
+        text: is_sos ? "SOS: " + text : text,
         is_sos: !!is_sos,
       });
 
-      // Try to send via IPCInbound REST
       try {
         const result = await callIpcInboundMessaging({
           imei,
-          text: outboundText,
+          text: is_sos ? "SOS: " + text : text,
         });
         res.json({ ok: true, gateway: result });
-      } catch (err) {
+      } catch (gatewayErr) {
         console.error(
-          "[POST /message] IPCInbound REST error:",
-          err.message
+          "[POST /message] IPCInbound error:",
+          gatewayErr.message
         );
-        // Keep message in ECC, but inform UI send failed
         res.status(500).json({
           error: "Gateway send failed",
-          detail: err.message,
+          detail: gatewayErr.message,
         });
       }
     } catch (err) {
@@ -534,7 +636,6 @@ app.post(
   }
 );
 
-// Acknowledge SOS (local only – no Emergency.svc yet)
 app.post(
   "/api/garmin/devices/:imei/ack-sos",
   authenticateApiKey,
@@ -553,6 +654,8 @@ app.post(
         is_sos: true,
       });
 
+      // If you later wire /Emergency/AcknowledgeDeclareEmergency, call it here.
+
       res.json({ ok: true, device });
     } catch (err) {
       console.error(
@@ -564,7 +667,6 @@ app.post(
   }
 );
 
-// Request location (stub – safe to call, just logs for now)
 app.post(
   "/api/garmin/devices/:imei/locate",
   authenticateApiKey,
@@ -575,11 +677,11 @@ app.post(
         "[LOCATE] Requested manual location for",
         imei
       );
-      // In future you can wire this to a specific IPCInbound endpoint.
+      // In future: wire to /Location/SendLocationRequest
       res.json({
         ok: true,
         note:
-          "Locate request accepted locally. Implement IPCInbound locate if Garmin exposes it.",
+          "Locate request accepted locally. Implement /Location/SendLocationRequest if needed.",
       });
     } catch (err) {
       console.error(
@@ -591,7 +693,7 @@ app.post(
   }
 );
 
-// --- GARMIN IPC OUTBOUND WEBHOOK (GARMIN → ECC) ---------------------
+// --- GARMIN IPC OUTBOUND WEBHOOK ------------------------------------
 
 app.post(
   "/garmin/ipc-outbound",
@@ -618,7 +720,6 @@ app.post(
 
       devicesStore.ingestIpcPayload(body);
 
-      // Respond quickly – Garmin expects fast 200
       res.status(200).json({ ok: true });
     } catch (err) {
       console.error("[GarminOutbound] Handler error:", err);
@@ -641,5 +742,5 @@ app.listen(PORT, () => {
   console.log(
     `MAGNUS Garmin ECC backend running on port ${PORT}`
   );
-  console.log("Active tenant ID:", ACTIVE_TENANT_ID);
+  console.log("Active tenant:", ACTIVE_TENANT_ID);
 });
