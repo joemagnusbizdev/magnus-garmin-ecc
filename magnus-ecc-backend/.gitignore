@@ -1,5 +1,0 @@
-node_modules/
-.env
-garmin.db
-garmin.db-shm
-garmin.db-wal
