@@ -110,21 +110,19 @@ function envBool(name, defaultVal = false) {
  * Right now only satdesk22 is active.
  *
  * Per Garmin:
- *  - REST:   https://ipcinbound.inreachapp.com/api/Messaging/Message  (X-API-KEY)
- *  - SOAP:   https://explore.garmin.com/IPCInbound/V1/Messaging.svc/Message (Username/Password)
+ *  - REST: POST https://ipcinbound.inreachapp.com/api/Messaging/Message (X-API-KEY)
+ *  - SOAP: POST https://explore.garmin.com/IPCInbound/V1/Messaging.svc/Message (Username/Password)
  */
 const TENANTS = {
   satdesk22: {
     rest: {
       enabled: envBool("SATDESK22_REST_ENABLED", false),
-      // Garmin REST base: https://ipcinbound.inreachapp.com/api
       baseUrl:
         process.env.SATDESK22_REST_BASE_URL ||
         "https://ipcinbound.inreachapp.com/api",
       apiKey: process.env.SATDESK22_REST_API_KEY || "",
     },
     soap: {
-      // Garmin SOAP base: https://explore.garmin.com/IPCInbound/V1
       baseUrl:
         process.env.SATDESK22_INBOUND_BASE_URL ||
         "https://explore.garmin.com/IPCInbound/V1",
@@ -220,7 +218,7 @@ async function sendViaRestMessaging(tenant, { imei, text }) {
       textBody
     );
     throw new Error(
-      `IPCInbound REST /Messaging/Message failed: ${res.status} ${res.statusText}`
+      `IPCInbound REST /Messaging/Message failed: ${res.status} ${res.statusText} ${textBody}`
     );
   }
 
@@ -231,7 +229,7 @@ async function sendViaRestMessaging(tenant, { imei, text }) {
 // --- IPC INBOUND: SOAP / V1 Messaging.svc ---------------------------
 
 /**
- * SOAP-style V1 (fallback):
+ * SOAP-style V1 (fallback ONLY when REST is not configured):
  *   POST https://explore.garmin.com/IPCInbound/V1/Messaging.svc/Message
  * Body:
  *   {
@@ -285,7 +283,7 @@ async function sendViaSoapMessaging(tenant, { imei, text }) {
       textBody
     );
     throw new Error(
-      `IPCInbound SOAP /Messaging.svc/Message failed: ${res.status} ${res.statusText}`
+      `IPCInbound SOAP /Messaging.svc/Message failed: ${res.status} ${res.statusText} ${textBody}`
     );
   }
 
@@ -304,8 +302,9 @@ async function sendViaSoapMessaging(tenant, { imei, text }) {
 
 /**
  * Main function called by /api/garmin/devices/:imei/message.
- * ✅ Tries REST first
- * 🔁 If REST fails or not configured, falls back to SOAP (if configured)
+ * ✅ Tries REST first if it is CONFIGURED.
+ * 🚫 If REST is configured but fails (4xx/5xx/etc) → we DO NOT fall back to SOAP.
+ * 🔁 SOAP is only used when REST is NOT configured at all for the tenant.
  */
 async function callIpcInboundMessaging({ imei, text }) {
   const tenant = getActiveTenant();
@@ -314,39 +313,42 @@ async function callIpcInboundMessaging({ imei, text }) {
     return { skipped: true, reason: "no-tenant" };
   }
 
-  console.log("[IPCInbound] Tenant config for send:", {
-    tenantId: ACTIVE_TENANT_ID,
-    restEnabled: tenant.rest?.enabled,
-    restBaseUrl: tenant.rest?.baseUrl,
-    restApiKeyPresent: !!tenant.rest?.apiKey,
-    soapBaseUrl: tenant.soap?.baseUrl,
-    soapUserPresent: !!tenant.soap?.username,
-  });
-
-  // 1️⃣ Try REST first (primary path)
-  if (
+  const hasRestConfig =
     tenant.rest &&
     tenant.rest.enabled &&
     tenant.rest.baseUrl &&
-    tenant.rest.apiKey
-  ) {
+    tenant.rest.apiKey;
+
+  const hasSoapConfig =
+    tenant.soap &&
+    tenant.soap.baseUrl &&
+    tenant.soap.username &&
+    tenant.soap.password;
+
+  console.log("[IPCInbound] Tenant config for send:", {
+    tenantId: ACTIVE_TENANT_ID,
+    hasRestConfig,
+    restBaseUrl: tenant.rest?.baseUrl,
+    hasSoapConfig,
+    soapBaseUrl: tenant.soap?.baseUrl,
+  });
+
+  // 1️⃣ REST configured → try it ONCE and DO NOT fall back on error
+  if (hasRestConfig) {
     try {
       return await sendViaRestMessaging(tenant, { imei, text });
     } catch (err) {
       console.error(
-        "[IPCInbound] REST send failed, will try SOAP if configured:",
+        "[IPCInbound] REST send failed; NOT falling back to SOAP for this tenant:",
         err.message || err
       );
+      // propagate so the route returns a 500 with REST error details
+      throw err;
     }
   }
 
-  // 2️⃣ Fallback to SOAP if configured
-  if (
-    tenant.soap &&
-    tenant.soap.baseUrl &&
-    tenant.soap.username &&
-    tenant.soap.password
-  ) {
+  // 2️⃣ REST not configured → optional SOAP fallback
+  if (hasSoapConfig) {
     return await sendViaSoapMessaging(tenant, { imei, text });
   }
 
@@ -676,8 +678,6 @@ app.post(
         text: "SOS acknowledged by MAGNUS ECC",
         is_sos: true,
       });
-
-      // If you later wire Emergency.svc for ACK/CLOSE, add it here.
 
       res.json({ ok: true, device });
     } catch (err) {
