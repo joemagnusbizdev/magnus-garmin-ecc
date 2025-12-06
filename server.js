@@ -97,44 +97,26 @@ function authenticateGarminOutbound(req, res, next) {
   return next();
 }
 
-// --- MULTI-TENANT CONFIG (REST + SOAP) -------------------------------
-
-function envBool(name, defaultVal = false) {
-  const v = process.env[name];
-  if (typeof v === "undefined") return defaultVal;
-  return ["1", "true", "yes", "on"].includes(String(v).toLowerCase());
-}
+// --- MULTI-TENANT CONFIG (SOAP ONLY) --------------------------------
 
 /**
  * One entry per satdesk account.
- * Right now only satdesk22 is active.
- *
- * Per Garmin:
- *  - REST: POST https://ipcinbound.inreachapp.com/api/Messaging/Message (X-API-KEY)
- *  - SOAP: POST https://explore.garmin.com/IPCInbound/V1/Messaging.svc/Message (Username/Password)
+ * Right now only satdesk22 is defined/used.
  */
 const TENANTS = {
   satdesk22: {
-    rest: {
-      enabled: envBool("SATDESK22_REST_ENABLED", false),
-      baseUrl:
-        process.env.SATDESK22_REST_BASE_URL ||
-        "https://ipcinbound.inreachapp.com/api",
-      apiKey: process.env.SATDESK22_REST_API_KEY || "",
-    },
+    // SOAP / V1 IPCInbound
+    // Should use: https://explore.garmin.com/IPCInbound/V1
     soap: {
-      baseUrl:
-        process.env.SATDESK22_INBOUND_BASE_URL ||
-        "https://explore.garmin.com/IPCInbound/V1",
+      baseUrl: process.env.SATDESK22_INBOUND_BASE_URL || "",
       username: process.env.SATDESK22_INBOUND_USERNAME || "",
       password: process.env.SATDESK22_INBOUND_PASSWORD || "",
     },
   },
 
-  // 🔜 FUTURE TENANTS – copy same structure:
-  // satdesk01: { rest: {...}, soap: {...} },
-  // satdesk02: { rest: {...}, soap: {...} },
-  // etc...
+  // 🔜 FUTURE TENANTS – copy structure:
+  // satdesk07: { soap: { baseUrl, username, password } },
+  // satdesk10: { soap: { ... } },
 };
 
 const ACTIVE_TENANT_ID =
@@ -153,90 +135,29 @@ function getActiveTenant() {
   return tenant;
 }
 
-// Build a REST url like: baseUrl + "/Messaging/Message"
-function buildRestUrl(tenant, path) {
-  const base = (tenant.rest.baseUrl || "").replace(/\/+$/, "");
-  return base + path;
-}
-
 // Build SOAP url like: baseUrl + "/Messaging.svc/Message"
 function buildSoapUrl(tenant, path) {
   const base = (tenant.soap.baseUrl || "").replace(/\/+$/, "");
   return base + path;
 }
 
-// --- IPC INBOUND: REST V2 Messaging ---------------------------------
+// --- IPC INBOUND: SOAP / V1 Messaging.svc ----------------------------
 
 /**
- * REST V2 (primary):
- *   POST https://ipcinbound.inreachapp.com/api/Messaging/Message
- * Headers:
- *   X-API-KEY: <REST_API_KEY>
+ * SOAP-style V1 (JSON-over-HTTP, Garmin style):
+ *
+ * POST https://explore.garmin.com/IPCInbound/V1/Messaging.svc/Message
+ *
  * Body:
- *   { Imei, Text }
- */
-async function sendViaRestMessaging(tenant, { imei, text }) {
-  if (
-    !tenant.rest ||
-    !tenant.rest.enabled ||
-    !tenant.rest.baseUrl ||
-    !tenant.rest.apiKey
-  ) {
-    console.log("[IPCInbound REST] REST not enabled or missing creds");
-    return { skipped: true, reason: "rest-disabled" };
-  }
-
-  const url = buildRestUrl(tenant, "/Messaging/Message");
-  const payload = {
-    Imei: imei,
-    Text: text,
-  };
-
-  console.log("[IPCInbound REST] POST", url, "payload:", payload);
-  const res = await fetch(url, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "X-API-KEY": tenant.rest.apiKey,
-    },
-    body: JSON.stringify(payload),
-  });
-
-  const textBody = await res.text();
-  let data = null;
-  try {
-    data = JSON.parse(textBody);
-  } catch (_e) {
-    // not JSON, keep raw
-  }
-
-  if (!res.ok) {
-    console.error(
-      "[IPCInbound REST] HTTP error",
-      res.status,
-      res.statusText,
-      textBody
-    );
-    throw new Error(
-      `IPCInbound REST /Messaging/Message failed: ${res.status} ${res.statusText} ${textBody}`
-    );
-  }
-
-  console.log("[IPCInbound REST] OK", data || textBody);
-  return data || { raw: textBody };
-}
-
-// --- IPC INBOUND: SOAP / V1 Messaging.svc ---------------------------
-
-/**
- * SOAP-style V1 (fallback ONLY when REST is not configured):
- *   POST https://explore.garmin.com/IPCInbound/V1/Messaging.svc/Message
- * Body:
- *   {
- *     Username,
- *     Password,
- *     Message: { Imei, Text, SendToInbox: true }
+ * {
+ *   "Username": "MagnusECC",
+ *   "Password": "MagnusDash3882!",
+ *   "Message": {
+ *     "Imei": "301434036796280",
+ *     "Text": "Hello from ECC",
+ *     "SendToInbox": true
  *   }
+ * }
  */
 async function sendViaSoapMessaging(tenant, { imei, text }) {
   if (
@@ -261,6 +182,7 @@ async function sendViaSoapMessaging(tenant, { imei, text }) {
   };
 
   console.log("[IPCInbound SOAP] POST", url, "payload:", payload);
+
   const res = await fetch(url, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -272,7 +194,7 @@ async function sendViaSoapMessaging(tenant, { imei, text }) {
   try {
     data = JSON.parse(textBody);
   } catch (_e) {
-    // ignore if not JSON
+    // Not JSON – keep raw
   }
 
   if (!res.ok) {
@@ -290,7 +212,7 @@ async function sendViaSoapMessaging(tenant, { imei, text }) {
   if (data && typeof data.Code !== "undefined" && data.Code !== 0) {
     console.error("[IPCInbound SOAP] Logical error response:", data);
     throw new Error(
-      `IPCInbound SOAP /Messaging.svc/Message failed: Code=${data.Code} ${data.Message}`
+      `IPCInbound SOAP /Messaging.svc/Message failed: Code=${data.Code} ${data.Message || ""}`
     );
   }
 
@@ -298,13 +220,11 @@ async function sendViaSoapMessaging(tenant, { imei, text }) {
   return data || { raw: textBody };
 }
 
-// --- IPC INBOUND MAIN DISPATCH --------------------------------------
+// --- IPC INBOUND MAIN DISPATCH (SOAP ONLY) --------------------------
 
 /**
  * Main function called by /api/garmin/devices/:imei/message.
- * ✅ Tries REST first if it is CONFIGURED.
- * 🚫 If REST is configured but fails (4xx/5xx/etc) → we DO NOT fall back to SOAP.
- * 🔁 SOAP is only used when REST is NOT configured at all for the tenant.
+ * SOAP is the ONLY path used here (REST is removed).
  */
 async function callIpcInboundMessaging({ imei, text }) {
   const tenant = getActiveTenant();
@@ -313,49 +233,26 @@ async function callIpcInboundMessaging({ imei, text }) {
     return { skipped: true, reason: "no-tenant" };
   }
 
-  const hasRestConfig =
-    tenant.rest &&
-    tenant.rest.enabled &&
-    tenant.rest.baseUrl &&
-    tenant.rest.apiKey;
-
-  const hasSoapConfig =
-    tenant.soap &&
-    tenant.soap.baseUrl &&
-    tenant.soap.username &&
-    tenant.soap.password;
-
-  console.log("[IPCInbound] Tenant config for send:", {
+  console.log("[IPCInbound] Tenant config for send (SOAP-only):", {
     tenantId: ACTIVE_TENANT_ID,
-    hasRestConfig,
-    restBaseUrl: tenant.rest?.baseUrl,
-    hasSoapConfig,
     soapBaseUrl: tenant.soap?.baseUrl,
+    soapUserPresent: !!tenant.soap?.username,
   });
 
-  // 1️⃣ REST configured → try it ONCE and DO NOT fall back on error
-  if (hasRestConfig) {
-    try {
-      return await sendViaRestMessaging(tenant, { imei, text });
-    } catch (err) {
-      console.error(
-        "[IPCInbound] REST send failed; NOT falling back to SOAP for this tenant:",
-        err.message || err
-      );
-      // propagate so the route returns a 500 with REST error details
-      throw err;
-    }
+  if (
+    !tenant.soap ||
+    !tenant.soap.baseUrl ||
+    !tenant.soap.username ||
+    !tenant.soap.password
+  ) {
+    console.warn(
+      "[IPCInbound] SOAP not configured for active tenant – skipping outbound send"
+    );
+    return { skipped: true, reason: "no-soap-credentials" };
   }
 
-  // 2️⃣ REST not configured → optional SOAP fallback
-  if (hasSoapConfig) {
-    return await sendViaSoapMessaging(tenant, { imei, text });
-  }
-
-  console.warn(
-    "[IPCInbound] No REST or SOAP credentials – skipping outbound send"
-  );
-  return { skipped: true, reason: "no-credentials" };
+  // Single path: SOAP
+  return await sendViaSoapMessaging(tenant, { imei, text });
 }
 
 // --- IN-MEMORY DEVICES STORE ----------------------------------------
@@ -615,7 +512,7 @@ app.get(
   }
 );
 
-// Send a message (ECC → Garmin → Device)
+// Send a message (ECC → Garmin → Device) via SOAP ONLY
 app.post(
   "/api/garmin/devices/:imei/message",
   authenticateApiKey,
