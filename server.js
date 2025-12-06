@@ -108,18 +108,26 @@ function envBool(name, defaultVal = false) {
 /**
  * One entry per satdesk account.
  * Right now only satdesk22 is active.
+ *
+ * Per Garmin:
+ *  - REST:   https://ipcinbound.inreachapp.com/api/Messaging/Message  (X-API-KEY)
+ *  - SOAP:   https://explore.garmin.com/IPCInbound/V1/Messaging.svc/Message (Username/Password)
  */
 const TENANTS = {
   satdesk22: {
     rest: {
       enabled: envBool("SATDESK22_REST_ENABLED", false),
-      // Should be: https://ipcinbound.inreachapp.com/api
-      baseUrl: process.env.SATDESK22_REST_BASE_URL || "",
+      // Garmin REST base: https://ipcinbound.inreachapp.com/api
+      baseUrl:
+        process.env.SATDESK22_REST_BASE_URL ||
+        "https://ipcinbound.inreachapp.com/api",
       apiKey: process.env.SATDESK22_REST_API_KEY || "",
     },
     soap: {
-      // Should be: https://explore.garmin.com/IPCInbound/V1
-      baseUrl: process.env.SATDESK22_INBOUND_BASE_URL || "",
+      // Garmin SOAP base: https://explore.garmin.com/IPCInbound/V1
+      baseUrl:
+        process.env.SATDESK22_INBOUND_BASE_URL ||
+        "https://explore.garmin.com/IPCInbound/V1",
       username: process.env.SATDESK22_INBOUND_USERNAME || "",
       password: process.env.SATDESK22_INBOUND_PASSWORD || "",
     },
@@ -162,9 +170,12 @@ function buildSoapUrl(tenant, path) {
 // --- IPC INBOUND: REST V2 Messaging ---------------------------------
 
 /**
- * REST V2: POST https://ipcinbound.inreachapp.com/api/Messaging/Message
- * Headers: X-API-KEY: <REST_API_KEY>
- * Body: { Imei, Text }
+ * REST V2 (primary):
+ *   POST https://ipcinbound.inreachapp.com/api/Messaging/Message
+ * Headers:
+ *   X-API-KEY: <REST_API_KEY>
+ * Body:
+ *   { Imei, Text }
  */
 async function sendViaRestMessaging(tenant, { imei, text }) {
   if (
@@ -220,14 +231,14 @@ async function sendViaRestMessaging(tenant, { imei, text }) {
 // --- IPC INBOUND: SOAP / V1 Messaging.svc ---------------------------
 
 /**
- * SOAP-style V1 (legacy):
- * POST https://explore.garmin.com/IPCInbound/V1/Messaging.svc/Message
+ * SOAP-style V1 (fallback):
+ *   POST https://explore.garmin.com/IPCInbound/V1/Messaging.svc/Message
  * Body:
- * {
- *   Username,
- *   Password,
- *   Message: { Imei, Text, SendToInbox: true }
- * }
+ *   {
+ *     Username,
+ *     Password,
+ *     Message: { Imei, Text, SendToInbox: true }
+ *   }
  */
 async function sendViaSoapMessaging(tenant, { imei, text }) {
   if (
@@ -293,7 +304,8 @@ async function sendViaSoapMessaging(tenant, { imei, text }) {
 
 /**
  * Main function called by /api/garmin/devices/:imei/message.
- * Tries REST first, falls back to SOAP if configured.
+ * ✅ Tries REST first
+ * 🔁 If REST fails or not configured, falls back to SOAP (if configured)
  */
 async function callIpcInboundMessaging({ imei, text }) {
   const tenant = getActiveTenant();
@@ -311,7 +323,7 @@ async function callIpcInboundMessaging({ imei, text }) {
     soapUserPresent: !!tenant.soap?.username,
   });
 
-  // Try REST first
+  // 1️⃣ Try REST first (primary path)
   if (
     tenant.rest &&
     tenant.rest.enabled &&
@@ -328,7 +340,7 @@ async function callIpcInboundMessaging({ imei, text }) {
     }
   }
 
-  // Fallback to SOAP if configured
+  // 2️⃣ Fallback to SOAP if configured
   if (
     tenant.soap &&
     tenant.soap.baseUrl &&
