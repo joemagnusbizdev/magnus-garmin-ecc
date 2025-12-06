@@ -169,6 +169,11 @@ async function sendViaSoapMessaging(tenant, { imei, text }) {
     console.log("[IPCInbound SOAP] SOAP not configured – skipping");
     return { skipped: true, reason: "soap-disabled" };
   }
+console.log("[SOAP creds sanity]", {
+  baseUrl: tenant.soap.baseUrl,
+  username: tenant.soap.username,
+  passwordLength: tenant.soap.password ? tenant.soap.password.length : 0,
+});
 
   const url = buildSoapUrl(tenant, "/Messaging.svc/Message");
   const payload = {
