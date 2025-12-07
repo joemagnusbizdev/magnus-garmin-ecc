@@ -242,6 +242,65 @@ app.post("/api/garmin/devices/:imei/sos-message", async (req, res) => {
   }
 });
 
+// --- REST: SOS message via Emergency/SendMessage --------------------
+app.post("/api/garmin/devices/:imei/sos-message", async (req, res) => {
+  try {
+    const imei = req.params.imei;
+    const { text } = req.body || {};
+
+    if (!imei || !text || !text.trim()) {
+      return res
+        .status(400)
+        .json({ error: "Missing IMEI or text for SOS message" });
+    }
+
+    const restBase = (process.env.SATDESK22_REST_BASE_URL || "").replace(/\/+$/, "");
+    const apiKey = process.env.SATDESK22_REST_API_KEY;
+
+    if (!restBase || !apiKey) {
+      console.error("[SOS message] REST not configured");
+      return res.status(500).json({ error: "REST not configured for SOS" });
+    }
+
+    const url = `${restBase}/Emergency/SendMessage`;
+
+    const payload = {
+      IMEI: imei,
+      UtcTimeStamp: new Date().toISOString(), // must be ISO UTC
+      Message: text.trim(),
+    };
+
+    console.log("[SOS message] POST", url, "payload:", payload);
+
+    const axiosResp = await axios.post(url, payload, {
+      headers: {
+        "Content-Type": "application/json",
+        "x-api-key": apiKey,
+      },
+      timeout: 10000,
+    });
+
+    console.log(
+      "[SOS message] Garmin response:",
+      axiosResp.status,
+      axiosResp.data
+    );
+
+    // Garmin returns 200 OK with empty body on success
+    return res.json({ ok: true });
+  } catch (err) {
+    const status = err.response?.status || 500;
+    const data = err.response?.data;
+
+    console.error("[SOS message] Error:", status, data || err.message);
+
+    return res.status(500).json({
+      error: "SOS message failed",
+      detail: data || err.message,
+    });
+  }
+});
+
 // Acknowledge SOS
 app.post("/api/garmin/devices/:imei/ack-sos", async (req, res) => {
   try {
