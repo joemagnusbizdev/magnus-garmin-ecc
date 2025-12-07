@@ -105,19 +105,20 @@ function authenticateGarminOutbound(req, res, next) {
  */
 const TENANTS = {
   satdesk22: {
-    // SOAP / V1 IPCInbound
-    // Should use: https://explore.garmin.com/IPCInbound/V1
+    // IPCInbound V1 (Basic auth + X-API-Key)
     soap: {
       baseUrl: process.env.SATDESK22_INBOUND_BASE_URL || "",
       username: process.env.SATDESK22_INBOUND_USERNAME || "",
       password: process.env.SATDESK22_INBOUND_PASSWORD || "",
+      apiKey: process.env.SATDESK22_INBOUND_API_KEY || "",
     },
   },
 
   // 🔜 FUTURE TENANTS – copy structure:
-  // satdesk07: { soap: { baseUrl, username, password } },
+  // satdesk07: { soap: { baseUrl, username, password, apiKey } },
   // satdesk10: { soap: { ... } },
 };
+
 
 const ACTIVE_TENANT_ID =
   process.env.ACTIVE_TENANT_ID || "satdesk22";
@@ -164,33 +165,46 @@ async function sendViaSoapMessaging(tenant, { imei, text }) {
     !tenant.soap ||
     !tenant.soap.baseUrl ||
     !tenant.soap.username ||
-    !tenant.soap.password
+    !tenant.soap.password ||
+    !tenant.soap.apiKey
   ) {
-    console.log("[IPCInbound SOAP] SOAP not configured – skipping");
+    console.log("[IPCInbound V1] Inbound not fully configured – skipping");
     return { skipped: true, reason: "soap-disabled" };
   }
-console.log("[SOAP creds sanity]", {
-  baseUrl: tenant.soap.baseUrl,
-  username: tenant.soap.username,
-  passwordLength: tenant.soap.password ? tenant.soap.password.length : 0,
-});
 
+  // Build full URL like: https://.../IPCInbound/V1/Messaging.svc/Message
   const url = buildSoapUrl(tenant, "/Messaging.svc/Message");
-  const payload = {
-    Username: tenant.soap.username,
-    Password: tenant.soap.password,
-    Message: {
-      Imei: imei,
-      Text: text,
-      SendToInbox: true,
-    },
+
+  // Build Basic auth header
+  const pair = `${tenant.soap.username}:${tenant.soap.password}`;
+  const basic = Buffer.from(pair, "ascii").toString("base64");
+
+  const headers = {
+    "Content-Type": "application/json",
+    Authorization: `Basic ${basic}`,
+    "X-API-Key": tenant.soap.apiKey,
   };
 
-  console.log("[IPCInbound SOAP] POST", url, "payload:", payload);
+  // Garmin expects /Date(ms)/ style timestamps
+  const now = Date.now();
+  const timestamp = `/Date(${now})/`;
+
+  const payload = {
+    Messages: [
+      {
+        Recipients: [Number(imei)],
+        Sender: "ecc@magnus.co.il",
+        Timestamp: timestamp,
+        Message: text,
+      },
+    ],
+  };
+
+  console.log("[IPCInbound V1] POST", url, "payload:", payload);
 
   const res = await fetch(url, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers,
     body: JSON.stringify(payload),
   });
 
@@ -204,32 +218,23 @@ console.log("[SOAP creds sanity]", {
 
   if (!res.ok) {
     console.error(
-      "[IPCInbound SOAP] HTTP error",
+      "[IPCInbound V1] HTTP error",
       res.status,
       res.statusText,
       textBody
     );
     throw new Error(
-      `IPCInbound SOAP /Messaging.svc/Message failed: ${res.status} ${res.statusText} ${textBody}`
+      `IPCInbound V1 /Messaging.svc/Message failed: ${res.status} ${res.statusText} ${textBody}`
     );
   }
 
-  if (data && typeof data.Code !== "undefined" && data.Code !== 0) {
-    console.error("[IPCInbound SOAP] Logical error response:", data);
-    throw new Error(
-      `IPCInbound SOAP /Messaging.svc/Message failed: Code=${data.Code} ${data.Message || ""}`
-    );
-  }
-
-  console.log("[IPCInbound SOAP] OK", data || textBody);
+  console.log("[IPCInbound V1] Success:", data || textBody);
   return data || { raw: textBody };
 }
 
-// --- IPC INBOUND MAIN DISPATCH (SOAP ONLY) --------------------------
-
 /**
  * Main function called by /api/garmin/devices/:imei/message.
- * SOAP is the ONLY path used here (REST is removed).
+ * Uses IPCInbound V1 (Basic auth + X-API-Key).
  */
 async function callIpcInboundMessaging({ imei, text }) {
   const tenant = getActiveTenant();
@@ -238,27 +243,29 @@ async function callIpcInboundMessaging({ imei, text }) {
     return { skipped: true, reason: "no-tenant" };
   }
 
-  console.log("[IPCInbound] Tenant config for send (SOAP-only):", {
+  console.log("[IPCInbound] Tenant config for send (V1):", {
     tenantId: ACTIVE_TENANT_ID,
-    soapBaseUrl: tenant.soap?.baseUrl,
-    soapUserPresent: !!tenant.soap?.username,
+    baseUrl: tenant.soap?.baseUrl,
+    userPresent: !!tenant.soap?.username,
+    apiKeyPresent: !!tenant.soap?.apiKey,
   });
 
   if (
     !tenant.soap ||
     !tenant.soap.baseUrl ||
     !tenant.soap.username ||
-    !tenant.soap.password
+    !tenant.soap.password ||
+    !tenant.soap.apiKey
   ) {
     console.warn(
-      "[IPCInbound] SOAP not configured for active tenant – skipping outbound send"
+      "[IPCInbound] Inbound V1 not configured for active tenant – skipping outbound send"
     );
     return { skipped: true, reason: "no-soap-credentials" };
   }
 
-  // Single path: SOAP
   return await sendViaSoapMessaging(tenant, { imei, text });
 }
+
 
 // --- IN-MEMORY DEVICES STORE ----------------------------------------
 
