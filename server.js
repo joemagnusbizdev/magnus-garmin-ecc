@@ -1,6 +1,6 @@
 // MAGNUS Garmin ECC backend
 // - IPC Outbound ingestion (events, SOS, tracking)
-// - IPC Inbound Messaging (Messaging.svc with Sender + Basic Auth)
+// - IPC Inbound Messaging (Messaging.svc with Basic Auth + X-API-Key)
 // - Emergency.svc ACK SOS with Code 15 soft-handling (GEOS)
 // - WebSockets for live updates
 // - CORS for WordPress (blog.magnusafety.com)
@@ -19,24 +19,16 @@ const INTERNAL_API_KEY = process.env.INTERNAL_API_KEY;
 const ACTIVE_TENANT_ID = process.env.ACTIVE_TENANT_ID || "satdesk22";
 const GARMIN_OUTBOUND_TOKEN = process.env.GARMIN_OUTBOUND_TOKEN || "";
 
-const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || "")
-  .split(",")
-  .map((s) => s.trim())
-  .filter(Boolean);
-
-// Per-tenant config
+// Tenant config
 const TENANTS = {
   satdesk22: {
     inbound: {
       // Example: https://eur-enterprise.inreach.garmin.com/IPCInbound/V1
-      baseUrl: (process.env.SATDESK22_INBOUND_BASE_URL || "").replace(
-        /\/+$/,
-        ""
-      ),
+      baseUrl: (process.env.SATDESK22_INBOUND_BASE_URL || "").replace(/\/+$/, ""),
       username: process.env.SATDESK22_INBOUND_USERNAME || "",
       password: process.env.SATDESK22_INBOUND_PASSWORD || "",
       apiKey: process.env.SATDESK22_INBOUND_API_KEY || "",
-      // 👇 NEW – this must be a valid, Garmin-accepted address
+      // 👇 MUST be a valid, Garmin-accepted sender (email/SMS)
       senderEmail: process.env.SATDESK22_SENDER_EMAIL || "",
     },
   },
@@ -45,31 +37,23 @@ const TENANTS = {
 // -------------------- APP + CORS --------------------
 const app = express();
 
+// simple explicit CORS allow-list for now
 const corsOptions = {
   origin: function (origin, cb) {
-    // Allow server-to-server / curl (no origin)
-    if (!origin) return cb(null, true);
-
-    if (!ALLOWED_ORIGINS.length || ALLOWED_ORIGINS.includes(origin)) {
-      return cb(null, true);
-    }
+    const allowed = [
+      "https://blog.magnusafety.com",
+      "http://localhost:5500",
+      "http://127.0.0.1:5500",
+    ];
+    if (!origin || allowed.includes(origin)) return cb(null, true);
     console.warn("[CORS] Blocked origin:", origin);
-    // Returning false just blocks it; avoids throwing PathError
-    return cb(null, false);
+    return cb(new Error("Not allowed by CORS"));
   },
   methods: ["GET", "POST", "OPTIONS"],
-  allowedHeaders: [
-    "Content-Type",
-    "Authorization",
-    "x-api-key",
-    "x-internal-api-key",
-  ],
-  credentials: false,
+  allowedHeaders: ["Content-Type", "x-api-key", "x-internal-api-key"],
 };
 
-// Apply CORS globally (handles preflight too)
 app.use(cors(corsOptions));
-
 app.use(bodyParser.json());
 
 // -------------------- AUTH MIDDLEWARE --------------------
@@ -205,7 +189,7 @@ class DevicesStore {
       if (!Array.isArray(d.sosTimeline)) d.sosTimeline = [];
     });
 
-    // Interpret messageCode (per Garmin table)
+    // Interpret messageCode
     switch (msgCode) {
       case 0: // Position Report
         dev.sosTimeline.push({
@@ -323,11 +307,11 @@ const devicesStore = new DevicesStore();
 
 // -------------------- IPC INBOUND HELPERS --------------------
 function getTenantConfig(tenantId) {
-  const cfg = TENANTS[tenantId];
-  if (!cfg || !cfg.inbound || !cfg.inbound.baseUrl) {
+  const cfgContainer = TENANTS[tenantId];
+  if (!cfgContainer || !cfgContainer.inbound || !cfgContainer.inbound.baseUrl) {
     throw new Error("Tenant inbound config missing for " + tenantId);
   }
-  return cfg.inbound;
+  return cfgContainer.inbound;
 }
 
 function buildInboundUrl(cfg, path) {
@@ -336,14 +320,12 @@ function buildInboundUrl(cfg, path) {
   return base + "/" + path;
 }
 
-// Messaging.svc – JSON with Messages[], Sender, Basic Auth + X-API-Key
+// Messaging.svc – Messages[], Sender MUST be valid email/SMS
 async function sendMessagingCommand(tenantId, imei, text) {
   const cfg = getTenantConfig(tenantId);
   const url = buildInboundUrl(cfg, "/Messaging.svc/Message");
 
-  const auth = Buffer.from(`${cfg.username}:${cfg.password}`).toString(
-    "base64"
-  );
+  const auth = Buffer.from(`${cfg.username}:${cfg.password}`).toString("base64");
 
   const headers = {
     Authorization: `Basic ${auth}`,
@@ -351,11 +333,23 @@ async function sendMessagingCommand(tenantId, imei, text) {
     "Content-Type": "application/json",
   };
 
+  const sender =
+    cfg.senderEmail ||
+    process.env.SATDESK22_SENDER_EMAIL ||
+    process.env.MESSAGING_SENDER_EMAIL ||
+    "";
+
+  if (!sender) {
+    throw new Error(
+      "No senderEmail configured; set SATDESK22_SENDER_EMAIL or TENANTS.satdesk22.inbound.senderEmail"
+    );
+  }
+
   const payload = {
     Messages: [
       {
         Recipients: [Number(imei)],
-        Sender: "MAGNUS ECC", // MUST be non-empty => fixes "message sender is empty"
+        Sender: sender,
         Timestamp: `/Date(${Date.now()})/`,
         Message: text,
       },
@@ -378,7 +372,7 @@ async function sendMessagingCommand(tenantId, imei, text) {
   return res.data;
 }
 
-// Emergency.svc AcknowledgeDeclare (Alternate SOS – Code 15 soft-handled)
+// Emergency.svc AcknowledgeDeclare
 async function acknowledgeSos(tenantId, imei) {
   const cfg = getTenantConfig(tenantId);
   const url = buildInboundUrl(
@@ -386,9 +380,7 @@ async function acknowledgeSos(tenantId, imei) {
     `/Emergency.svc/AcknowledgeDeclare?imei=${encodeURIComponent(imei)}`
   );
 
-  const auth = Buffer.from(`${cfg.username}:${cfg.password}`).toString(
-    "base64"
-  );
+  const auth = Buffer.from(`${cfg.username}:${cfg.password}`).toString("base64");
 
   console.log("[Emergency] ACK SOS POST", url);
 
@@ -410,7 +402,7 @@ async function acknowledgeSos(tenantId, imei) {
 
 // -------------------- ROUTES --------------------
 
-// Simple healthcheck
+// Healthcheck
 app.get("/", (req, res) => {
   res.json({ ok: true, service: "MAGNUS Garmin ECC backend" });
 });
@@ -419,7 +411,7 @@ app.get("/health", (req, res) => {
   res.json({ status: "ok" });
 });
 
-// Device list + detail (front-end uses these)
+// Device list + detail (front-end)
 app.get("/api/garmin/devices", authenticateApiKey, (req, res) => {
   res.json(devicesStore.list());
 });
@@ -458,7 +450,7 @@ app.post("/garmin/ipc-outbound", (req, res) => {
   res.json({ ok: true });
 });
 
-// Send *normal* message (used for both normal + SOS-labelled messages)
+// Send message (normal or SOS-labeled)
 app.post(
   "/api/garmin/devices/:imei/message",
   authenticateApiKey,
@@ -473,7 +465,7 @@ app.post(
           .json({ error: "Missing IMEI or text for message" });
       }
 
-      // Store outbound in ECC
+      // Store outbound in ECC history
       devicesStore.addOutboundMessage(imei, {
         text: text.trim(),
         is_sos: !!is_sos,
@@ -501,7 +493,7 @@ app.post(
   }
 );
 
-// ACK SOS (Code 15 => soft success / GEOS)
+// ACK SOS (Code 15 => GEOS soft success)
 app.post(
   "/api/garmin/devices/:imei/ack-sos",
   authenticateApiKey,
