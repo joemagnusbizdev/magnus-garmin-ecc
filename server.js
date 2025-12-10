@@ -1,9 +1,9 @@
 // MAGNUS Garmin ECC backend
-// - IPC Outbound webhook
-// - IPC Inbound Messaging.svc (normal + SOS-flagged messages)
-// - Emergency.svc Acknowledge
+// - IPC Outbound ingestion (events, SOS, tracking)
+// - IPC Inbound Messaging (SOAP-style JSON: Username/Password/Message)
+// - Emergency.svc ACK SOS with Code 15 soft-handling
 // - WebSockets for live updates
-// - SOS lifecycle wired to Garmin message codes 0/2/4/6/7 etc.
+// - CORS for WordPress (blog.magnusafety.com)
 
 const express = require("express");
 const axios = require("axios");
@@ -13,46 +13,89 @@ const http = require("http");
 const WebSocket = require("ws");
 require("dotenv").config();
 
-// ------------------ CONFIG ------------------
+// -------------------- ENV --------------------
 const PORT = process.env.PORT || 10000;
 const INTERNAL_API_KEY = process.env.INTERNAL_API_KEY;
 const ACTIVE_TENANT_ID = process.env.ACTIVE_TENANT_ID || "satdesk22";
-const GARMIN_OUTBOUND_TOKEN = process.env.GARMIN_OUTBOUND_TOKEN;
+const GARMIN_OUTBOUND_TOKEN = process.env.GARMIN_OUTBOUND_TOKEN || "";
 
 const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || "")
   .split(",")
   .map((s) => s.trim())
   .filter(Boolean);
 
-// Tenant config (only satdesk22 for now)
+// Per-tenant config (you can add more tenants later)
 const TENANTS = {
   satdesk22: {
     inbound: {
-      baseUrl: process.env.SATDESK22_INBOUND_BASE_URL || "",
+      // IMPORTANT: this should be like:
+      // https://eur-enterprise.inreach.garmin.com/IPCInbound/V1
+      baseUrl: (process.env.SATDESK22_INBOUND_BASE_URL || "").replace(
+        /\/+$/,
+        ""
+      ),
       username: process.env.SATDESK22_INBOUND_USERNAME || "",
       password: process.env.SATDESK22_INBOUND_PASSWORD || "",
-      apiKey: process.env.SATDESK22_INBOUND_API_KEY || "",
+      apiKey: process.env.SATDESK22_INBOUND_API_KEY || "", // not used by SOAP, but kept for future
     },
   },
 };
 
-// ------------------ EXPRESS + WS SETUP ------------------
+// -------------------- APP + CORS --------------------
 const app = express();
 
-app.use(
-  cors({
-    origin: (origin, cb) => {
-      if (!origin) return cb(null, true); // curl / backend
-      if (ALLOWED_ORIGINS.length === 0) return cb(null, true);
-      if (ALLOWED_ORIGINS.includes(origin)) return cb(null, true);
-      return cb(new Error("Not allowed by CORS"), false);
-    },
-    credentials: false,
-  })
-);
+const corsOptions = {
+  origin: function (origin, cb) {
+    // Allow same-origin / server-to-server (origin === undefined)
+    if (!origin) return cb(null, true);
+
+    if (!ALLOWED_ORIGINS.length || ALLOWED_ORIGINS.includes(origin)) {
+      return cb(null, true);
+    }
+    console.warn("[CORS] Blocked origin:", origin);
+    cb(null, false);
+  },
+  methods: ["GET", "POST", "OPTIONS"],
+  allowedHeaders: [
+    "Content-Type",
+    "Authorization",
+    "x-api-key",
+    "x-internal-api-key",
+  ],
+  credentials: false,
+};
+
+app.use(cors(corsOptions));
+app.options("*", cors(corsOptions)); // handle all preflights
 
 app.use(bodyParser.json());
 
+// -------------------- AUTH MIDDLEWARE --------------------
+function authenticateApiKey(req, res, next) {
+  if (!INTERNAL_API_KEY) {
+    console.warn("[Auth] INTERNAL_API_KEY not set; skipping auth");
+    return next();
+  }
+
+  const sentKey =
+    req.headers["x-api-key"] ||
+    req.headers["x-internal-api-key"] ||
+    req.headers["x_api_key"];
+
+  if (sentKey !== INTERNAL_API_KEY) {
+    console.warn("[Auth] Unauthorized request", {
+      path: req.path,
+      method: req.method,
+      sentLen: sentKey ? String(sentKey).length : 0,
+      expectedLen: INTERNAL_API_KEY.length,
+    });
+    return res.status(401).json({ error: "Unauthorized" });
+  }
+
+  return next();
+}
+
+// -------------------- WEBSOCKETS --------------------
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
 
@@ -68,11 +111,10 @@ wss.on("connection", (ws) => {
   ws.on("close", () => console.log("[WS] Client disconnected"));
 });
 
-// ------------------ DEVICE STORE ------------------
-
+// -------------------- DEVICE STORE --------------------
 class DevicesStore {
   constructor() {
-    this.devices = {}; // imei -> device object
+    this.devices = {};
   }
 
   get(imei) {
@@ -87,9 +129,8 @@ class DevicesStore {
     if (!this.devices[imei]) {
       this.devices[imei] = {
         imei,
-        status: "open",
+        label: imei,
         messages: [],
-        positions: [],
         sosTimeline: [],
         isActiveSos: false,
       };
@@ -98,82 +139,71 @@ class DevicesStore {
     return this.devices[imei];
   }
 
-  // Add inbound text message from an IPC event
   addInboundMessageFromEvent(evt) {
     const imei = evt.imei || evt.Imei;
     if (!imei) return;
 
-    const text = evt.freeText || evt.message || "";
-    if (!text) return;
-
     const tsIso = new Date().toISOString();
+    const text = evt.freeText || evt.message || evt.Message || "";
 
-    const dev = this.update(imei, (d) => {
+    this.update(imei, (d) => {
       if (!Array.isArray(d.messages)) d.messages = [];
       d.messages.push({
-        id: "in-" + Date.now() + "-" + Math.random().toString(16).slice(2),
+        id: "in-" + Date.now(),
         direction: "inbound",
         text,
-        is_sos: !!d.isActiveSos,
         timestamp: tsIso,
+        is_sos: false,
       });
       d.lastMessageAt = tsIso;
     });
-
-    global._wsBroadcast({ type: "deviceUpdate", device: dev });
   }
 
-  // Add outbound message we sent from ECC
   addOutboundMessage(imei, { text, is_sos }) {
     const tsIso = new Date().toISOString();
-    const dev = this.update(imei, (d) => {
+    this.update(imei, (d) => {
       if (!Array.isArray(d.messages)) d.messages = [];
       d.messages.push({
-        id: "out-" + Date.now() + "-" + Math.random().toString(16).slice(2),
+        id: "out-" + Date.now(),
         direction: "outbound",
         text,
-        is_sos: !!is_sos,
         timestamp: tsIso,
+        is_sos: !!is_sos,
       });
       d.lastMessageAt = tsIso;
     });
-
-    global._wsBroadcast({ type: "deviceUpdate", device: dev });
   }
 
-  // Ingest an IPC outbound event from Garmin
   ingestEvent(evt) {
     const imei = evt.imei || evt.Imei;
     if (!imei) return;
 
     const tsIso = new Date().toISOString();
-    const code = evt.messageCode; // numeric message code from Garmin
+    const code = evt.messageCode;
     const msgCode = Number(code);
     const text = evt.freeText || evt.message || "";
     const point = evt.point || evt.Point || null;
 
-    // Base update: always bump lastEventAt and last known position if present
     const dev = this.update(imei, (d) => {
       d.lastEventAt = tsIso;
 
       if (point && point.latitude != null && point.longitude != null) {
-        if (!Array.isArray(d.positions)) d.positions = [];
-        const pos = {
-          lat: point.latitude,
-          lon: point.longitude,
-          altitude: point.altitude ?? 0,
-          speed: point.speed ?? 0,
-          course: point.course ?? 0,
-          gpsFix: point.gpsFix ?? point.gps_fix ?? 0,
+        d.point = {
+          latitude: point.latitude,
+          longitude: point.longitude,
+          altitude: point.altitude,
+          gpsFix: point.gpsFix ?? point.gps_fix ?? null,
+          course: point.course,
+          speed: point.speed,
           timestamp: tsIso,
         };
-        d.positions.push(pos);
-        d.point = pos;
         d.lastPositionAt = tsIso;
       }
+
+      if (!Array.isArray(d.sosTimeline)) d.sosTimeline = [];
     });
 
-    // ---- Interpret messageCode per Garmin table ----
+    // Interpret messageCode (from the Garmin table you got)
     switch (msgCode) {
       case 0: // Position Report
         dev.sosTimeline.push({
@@ -183,8 +213,8 @@ class DevicesStore {
         });
         break;
 
-      case 2: // Free Text Message
-      case 3099: // Canned / QuickText
+      case 2: // Free Text
+      case 3099: // Canned message / QuickText
         this.addInboundMessageFromEvent(evt);
         dev.sosTimeline.push({
           type: "inbound-message",
@@ -261,7 +291,6 @@ class DevicesStore {
         break;
 
       default:
-        // Fallback: if there is text but an unknown code, still store as inbound
         if (text) {
           this.addInboundMessageFromEvent(evt);
           dev.sosTimeline.push({
@@ -280,10 +309,8 @@ class DevicesStore {
         break;
     }
 
-    // ---- Notify front-end via WebSocket ----
     global._wsBroadcast({ type: "deviceUpdate", device: dev });
 
-    // For any SOS-related code, also send a dedicated sosUpdate
     if (msgCode === 4 || msgCode === 6 || msgCode === 7) {
       global._wsBroadcast({ type: "sosUpdate", device: dev });
     }
@@ -292,185 +319,176 @@ class DevicesStore {
 
 const devicesStore = new DevicesStore();
 
-// ------------------ IPC INBOUND HELPERS ------------------
+// -------------------- IPC INBOUND HELPERS --------------------
+function getTenantConfig(tenantId) {
+  const cfg = TENANTS[tenantId];
+  if (!cfg || !cfg.inbound || !cfg.inbound.baseUrl) {
+    throw new Error("Tenant inbound config missing for " + tenantId);
+  }
+  return cfg.inbound;
+}
 
 function buildInboundUrl(cfg, path) {
-  const base = (cfg.baseUrl || "").replace(/\/+$/, "");
-  return `${base}${path}`;
+  const base = cfg.baseUrl.replace(/\/+$/, "");
+  if (path.startsWith("/")) return base + path;
+  return base + "/" + path;
 }
 
+// Messaging.svc SOAP-style JSON (this is what worked in PowerShell)
 async function sendMessagingCommand(tenantId, imei, text) {
-  const cfg = TENANTS[tenantId]?.inbound;
-  if (!cfg || !cfg.baseUrl || !cfg.username || !cfg.password) {
-    throw new Error("Inbound IPC not configured for tenant " + tenantId);
-  }
-
+  const cfg = getTenantConfig(tenantId);
   const url = buildInboundUrl(cfg, "/Messaging.svc/Message");
-  const auth = Buffer.from(`${cfg.username}:${cfg.password}`).toString("base64");
-
-  const headers = {
-    Authorization: `Basic ${auth}`,
-    "Content-Type": "application/json",
-  };
-
-  if (cfg.apiKey) {
-    headers["X-API-Key"] = cfg.apiKey;
-  }
 
   const payload = {
-    Messages: [
-      {
-        Recipients: [Number(imei)],
-        Message: text,
-        Timestamp: `/Date(${Date.now()})/`,
-      },
-    ],
+    Username: cfg.username,
+    Password: cfg.password,
+    Message: {
+      Imei: String(imei),
+      Text: text,
+      SendToInbox: true,
+    },
   };
 
-  console.log("[Messaging.svc] POST", url, "payload:", payload);
+  console.log("[Messaging] POST", url, "payload:", payload);
 
-  const res = await axios.post(url, payload, { headers, timeout: 15000 });
-  console.log("[Messaging.svc] response:", res.status, res.data);
+  const res = await axios.post(url, payload, {
+    headers: { "Content-Type": "application/json" },
+    timeout: 10000,
+  });
+
+  console.log(
+    "[Messaging] Garmin response:",
+    res.status,
+    JSON.stringify(res.data)
+  );
+
   return res.data;
 }
 
-function buildEmergencyUrl(cfg, path) {
-  const base = (cfg.baseUrl || "").replace(/\/+$/, "");
-  return `${base}/Emergency.svc${path}`;
-}
-
+// Emergency.svc AcknowledgeDeclare
 async function acknowledgeSos(tenantId, imei) {
-  const cfg = TENANTS[tenantId]?.inbound;
-  if (!cfg || !cfg.baseUrl || !cfg.username || !cfg.password) {
-    throw new Error("Emergency.svc not configured for tenant " + tenantId);
-  }
+  const cfg = getTenantConfig(tenantId);
+  const url = buildInboundUrl(
+    cfg,
+    `/Emergency.svc/AcknowledgeDeclare?imei=${encodeURIComponent(imei)}`
+  );
 
-  const url = buildEmergencyUrl(cfg, `/AcknowledgeDeclare?imei=${encodeURIComponent(imei)}`);
-  const auth = Buffer.from(`${cfg.username}:${cfg.password}`).toString("base64");
+  const auth = Buffer.from(`${cfg.username}:${cfg.password}`).toString(
+    "base64"
+  );
 
-  const headers = {
-    Authorization: `Basic ${auth}`,
-    "Content-Type": "application/json",
-  };
+  console.log("[Emergency] ACK SOS POST", url);
 
-  console.log("[Emergency.svc] ACK POST", url);
-  const res = await axios.post(url, {}, { headers, timeout: 10000 });
-  console.log("[Emergency.svc] ACK response:", res.status, res.data);
+  const res = await axios.post(
+    url,
+    {},
+    {
+      headers: {
+        Authorization: `Basic ${auth}`,
+        "Content-Type": "application/json",
+      },
+      timeout: 10000,
+    }
+  );
+
+  console.log("[Emergency] ACK response:", res.status, res.data);
   return res.data;
 }
 
-// ------------------ AUTH MIDDLEWARE ------------------
+// -------------------- ROUTES --------------------
 
-function authenticateApiKey(req, res, next) {
-  // If no key configured on the server, don't block anything
-  if (!INTERNAL_API_KEY) {
-    console.warn("[Auth] INTERNAL_API_KEY not set; skipping auth");
-    return next();
-  }
-
-  // Accept either header name (for older / newer frontends)
-  const sentKey =
-    req.headers["x-api-key"] ||
-    req.headers["x-internal-api-key"] || // legacy
-    req.headers["x_api_key"];
-
-  if (sentKey !== INTERNAL_API_KEY) {
-    console.warn("[Auth] Unauthorized request", {
-      path: req.path,
-      method: req.method,
-      // don't log the real key, just lengths for debugging
-      sentLen: sentKey ? String(sentKey).length : 0,
-      expectedLen: INTERNAL_API_KEY.length,
-    });
-    return res.status(401).json({ error: "Unauthorized" });
-  }
-
-  return next();
-}
-// ------------------ ROUTES ------------------
+// Simple healthcheck
+app.get("/", (req, res) => {
+  res.json({ ok: true, service: "MAGNUS Garmin ECC backend" });
+});
 
 app.get("/health", (req, res) => {
-  res.json({ ok: true, ts: new Date().toISOString() });
+  res.json({ status: "ok" });
 });
 
-// IPC Outbound webhook from Garmin
-app.post("/garmin/ipc-outbound", (req, res) => {
-  try {
-    const token = req.headers["x-outbound-auth-token"];
-    if (GARMIN_OUTBOUND_TOKEN && token !== GARMIN_OUTBOUND_TOKEN) {
-      console.warn("[GarminOutbound] Invalid token:", token);
-      return res.status(401).json({ error: "Invalid outbound token" });
-    }
-
-    console.log("[GarminOutbound] Auth OK");
-    console.log(
-      "[GarminOutbound] FULL IPC PAYLOAD:",
-      JSON.stringify(req.body, null, 2)
-    );
-
-    const events = req.body?.Events || [];
-    events.forEach((evt) => devicesStore.ingestEvent(evt));
-
-    console.log(
-      "[DevicesStore] After IPC, total devices:",
-      devicesStore.list().length
-    );
-
-    return res.json({ ok: true });
-  } catch (err) {
-    console.error("[GarminOutbound] Error:", err);
-    return res.status(500).json({ error: "Failed to process IPC outbound" });
-  }
-});
-
-// ---- API: list devices ----
+// Device list + detail (front-end uses these)
 app.get("/api/garmin/devices", authenticateApiKey, (req, res) => {
   res.json(devicesStore.list());
 });
 
-// ---- API: device detail ----
 app.get("/api/garmin/devices/:imei", authenticateApiKey, (req, res) => {
   const imei = req.params.imei;
   const dev = devicesStore.get(imei);
-  if (!dev) return res.json({ device: null, messages: [], positions: [] });
-
-  res.json({
-    device: dev,
-    messages: dev.messages || [],
-    positions: dev.positions || [],
-  });
+  if (!dev) return res.json({});
+  res.json(dev);
 });
 
-// ---- API: send normal / SOS-flagged message (Messaging.svc) ----
-app.post("/api/garmin/devices/:imei/message", authenticateApiKey, async (req, res) => {
-  try {
-    const imei = req.params.imei;
-    const { text, is_sos } = req.body || {};
-
-    if (!imei || !text || !text.trim()) {
-      return res.status(400).json({ error: "Missing IMEI or text" });
-    }
-
-    const cleanText = String(text).trim();
-
-    // Store outbound in local history first
-    devicesStore.addOutboundMessage(imei, {
-      text: cleanText,
-      is_sos: !!is_sos,
-    });
-
-    // Send via IPCInbound Messaging.svc
-    const gateway = await sendMessagingCommand(ACTIVE_TENANT_ID, imei, cleanText);
-
-    return res.json({ ok: true, gateway });
-  } catch (err) {
-    console.error("[/message] IPCInbound error:", err.response?.data || err.message);
-    return res.status(500).json({
-      error: "Messaging failed",
-      detail: err.response?.data || err.message,
-    });
+// IPC Outbound webhook from Garmin
+app.post("/garmin/ipc-outbound", (req, res) => {
+  const token = req.headers["x-outbound-auth-token"];
+  if (!GARMIN_OUTBOUND_TOKEN || token !== GARMIN_OUTBOUND_TOKEN) {
+    console.warn(
+      "[GarminOutbound] Invalid token",
+      token,
+      "expected",
+      GARMIN_OUTBOUND_TOKEN
+    );
+    return res.status(401).json({ error: "Invalid token" });
   }
+
+  console.log("[GarminOutbound] Auth OK");
+  console.log("[GarminOutbound] FULL IPC PAYLOAD:", JSON.stringify(req.body));
+
+  const events = req.body.Events || [];
+  events.forEach((evt) => devicesStore.ingestEvent(evt));
+
+  console.log(
+    "[DevicesStore] After IPC, total devices:",
+    devicesStore.list().length
+  );
+
+  res.json({ ok: true });
 });
+
+// Send *normal* message (used for both normal + SOS-labelled messages)
+app.post(
+  "/api/garmin/devices/:imei/message",
+  authenticateApiKey,
+  async (req, res) => {
+    try {
+      const imei = req.params.imei;
+      const { text, is_sos } = req.body || {};
+
+      if (!imei || !text || !text.trim()) {
+        return res
+          .status(400)
+          .json({ error: "Missing IMEI or text for message" });
+      }
+
+      // Store outbound in ECC
+      devicesStore.addOutboundMessage(imei, {
+        text: text.trim(),
+        is_sos: !!is_sos,
+      });
+
+      const result = await sendMessagingCommand(
+        ACTIVE_TENANT_ID,
+        imei,
+        text.trim()
+      );
+
+      const device = devicesStore.get(imei);
+      global._wsBroadcast({ type: "deviceUpdate", device });
+
+      res.json({ ok: true, result });
+    } catch (err) {
+      const status = err.response?.status || 500;
+      const data = err.response?.data;
+      console.error("[/message] Messaging failed:", status, data || err.message);
+      res.status(500).json({
+        error: "Messaging failed",
+        detail: data || err.message,
+      });
+    }
+  }
+);
+
+// ACK SOS (Code 15 => soft success)
 app.post(
   "/api/garmin/devices/:imei/ack-sos",
   authenticateApiKey,
@@ -488,16 +506,14 @@ app.post(
         const data = err.response?.data;
         const code = data?.Code;
 
-        // If Garmin says "Illegal emergency action" (Code 15),
-        // it means GEOS is the SOS provider – treat as soft-success.
         if (code === 15) {
+          // IllegalEmergencyActionError – GEOS is the SOS provider
           console.warn(
-            "[ack-sos] Illegal emergency action (Code 15) – SOS handled by GEOS, not tenant.",
+            "[ack-sos] Code 15 – SOS handled by GEOS, treating as soft success",
             data
           );
-          remoteResult = data; // keep for inspection
+          remoteResult = data;
         } else {
-          // real error – bubble up
           console.error("[ack-sos] Error:", data || err.message);
           return res.status(500).json({
             error: "ACK SOS failed",
@@ -506,7 +522,6 @@ app.post(
         }
       }
 
-      // Update local device regardless (we still want ECC timeline clean)
       const device = devicesStore.update(imei, (d) => {
         d.isActiveSos = false;
         d.lastSosAckAt = new Date().toISOString();
@@ -514,57 +529,25 @@ app.post(
         d.sosTimeline.push({
           type: "sos-ack",
           at: d.lastSosAckAt,
-          note: "Locally acknowledged; SOS provider is GEOS",
+          note: "Locally acknowledged; SOS provider may be GEOS",
         });
       });
 
       global._wsBroadcast({ type: "sosUpdate", device });
 
-      return res.json({
+      res.json({
         ok: true,
-        provider: "GEOS",
+        provider: "GEOS-or-tenant",
         remoteResult,
       });
     } catch (err) {
       console.error("[ack-sos] Unexpected error:", err);
-      return res.status(500).json({
-        error: "ACK SOS failed",
-        detail: err.message,
-      });
+      res.status(500).json({ error: "ACK SOS failed", detail: err.message });
     }
   }
 );
 
-
-// ---- OPTIONAL: stubs for locate / tracking (so UI doesn’t 404) ----
-app.post(
-  "/api/garmin/devices/:imei/locate",
-  authenticateApiKey,
-  async (req, res) => {
-    const imei = req.params.imei;
-    console.log("[LOCATE] Request for IMEI", imei);
-    // TODO: send IPCInbound Locate command if needed
-    return res.json({ ok: true });
-  }
-);
-
-app.post(
-  "/api/garmin/devices/:imei/tracking",
-  authenticateApiKey,
-  async (req, res) => {
-    const imei = req.params.imei;
-    const { enabled } = req.body || {};
-    console.log("[TRACKING] Request for IMEI", imei, "enabled:", enabled);
-
-    const dev = devicesStore.update(imei, (d) => {
-      d.trackingEnabled = !!enabled;
-    });
-
-    return res.json({ ok: true, trackingEnabled: !!dev.trackingEnabled });
-  }
-);
-
-// ------------------ START ------------------
+// -------------------- START SERVER --------------------
 server.listen(PORT, () => {
   console.log("MAGNUS Garmin ECC backend running on port", PORT);
 });
