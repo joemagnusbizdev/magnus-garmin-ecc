@@ -362,18 +362,31 @@ async function acknowledgeSos(tenantId, imei) {
 // ------------------ AUTH MIDDLEWARE ------------------
 
 function authenticateApiKey(req, res, next) {
+  // If no key configured on the server, don't block anything
   if (!INTERNAL_API_KEY) {
-    console.warn("[Auth] INTERNAL_API_KEY not set; allowing request.");
+    console.warn("[Auth] INTERNAL_API_KEY not set; skipping auth");
     return next();
   }
 
-  const key = req.headers["x-api-key"];
-  if (key !== INTERNAL_API_KEY) {
+  // Accept either header name (for older / newer frontends)
+  const sentKey =
+    req.headers["x-api-key"] ||
+    req.headers["x-internal-api-key"] || // legacy
+    req.headers["x_api_key"];
+
+  if (sentKey !== INTERNAL_API_KEY) {
+    console.warn("[Auth] Unauthorized request", {
+      path: req.path,
+      method: req.method,
+      // don't log the real key, just lengths for debugging
+      sentLen: sentKey ? String(sentKey).length : 0,
+      expectedLen: INTERNAL_API_KEY.length,
+    });
     return res.status(401).json({ error: "Unauthorized" });
   }
-  next();
-}
 
+  return next();
+}
 // ------------------ ROUTES ------------------
 
 app.get("/health", (req, res) => {
