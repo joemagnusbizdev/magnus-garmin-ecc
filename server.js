@@ -1,7 +1,7 @@
 // MAGNUS Garmin ECC backend
 // - IPC Outbound ingestion (events, SOS, tracking)
-// - IPC Inbound Messaging (SOAP-style JSON: Username/Password/Message)
-// - Emergency.svc ACK SOS with Code 15 soft-handling
+// - IPC Inbound Messaging (Messaging.svc with Sender + Basic Auth)
+// - Emergency.svc ACK SOS with Code 15 soft-handling (GEOS)
 // - WebSockets for live updates
 // - CORS for WordPress (blog.magnusafety.com)
 
@@ -24,19 +24,18 @@ const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || "")
   .map((s) => s.trim())
   .filter(Boolean);
 
-// Per-tenant config (you can add more tenants later)
+// Per-tenant config
 const TENANTS = {
   satdesk22: {
     inbound: {
-      // IMPORTANT: this should be like:
-      // https://eur-enterprise.inreach.garmin.com/IPCInbound/V1
+      // Example: https://eur-enterprise.inreach.garmin.com/IPCInbound/V1
       baseUrl: (process.env.SATDESK22_INBOUND_BASE_URL || "").replace(
         /\/+$/,
         ""
       ),
       username: process.env.SATDESK22_INBOUND_USERNAME || "",
       password: process.env.SATDESK22_INBOUND_PASSWORD || "",
-      apiKey: process.env.SATDESK22_INBOUND_API_KEY || "", // not used by SOAP, but kept for future
+      apiKey: process.env.SATDESK22_INBOUND_API_KEY || "", // used for X-API-Key
     },
   },
 };
@@ -46,14 +45,15 @@ const app = express();
 
 const corsOptions = {
   origin: function (origin, cb) {
-    // Allow same-origin / server-to-server (origin === undefined)
+    // Allow server-to-server / curl (no origin)
     if (!origin) return cb(null, true);
 
     if (!ALLOWED_ORIGINS.length || ALLOWED_ORIGINS.includes(origin)) {
       return cb(null, true);
     }
     console.warn("[CORS] Blocked origin:", origin);
-    cb(null, false);
+    // Returning false just blocks it; avoids throwing PathError
+    return cb(null, false);
   },
   methods: ["GET", "POST", "OPTIONS"],
   allowedHeaders: [
@@ -65,28 +65,8 @@ const corsOptions = {
   credentials: false,
 };
 
-
-// CORS config
-const corsOptions = {
-  origin: function (origin, cb) {
-    const allowed = [
-      "https://blog.magnusafety.com",
-      "http://localhost:5500",
-      "http://127.0.0.1:5500"
-    ];
-    if (!origin || allowed.includes(origin)) return cb(null, true);
-    return cb(new Error("Not allowed by CORS"));
-  },
-  methods: ["GET", "POST", "OPTIONS"],
-  allowedHeaders: ["Content-Type", "x-api-key"],
-};
-
-// apply globally
+// Apply CORS globally (handles preflight too)
 app.use(cors(corsOptions));
-
-// handle preflight only for API routes (✅ Express 5 friendly)
-app.options("/api/*", cors(corsOptions));
-
 
 app.use(bodyParser.json());
 
@@ -223,7 +203,7 @@ class DevicesStore {
       if (!Array.isArray(d.sosTimeline)) d.sosTimeline = [];
     });
 
-    // Interpret messageCode (from the Garmin table you got)
+    // Interpret messageCode (per Garmin table)
     switch (msgCode) {
       case 0: // Position Report
         dev.sosTimeline.push({
@@ -234,7 +214,7 @@ class DevicesStore {
         break;
 
       case 2: // Free Text
-      case 3099: // Canned message / QuickText
+      case 3099: // Canned / QuickText
         this.addInboundMessageFromEvent(evt);
         dev.sosTimeline.push({
           type: "inbound-message",
@@ -354,25 +334,36 @@ function buildInboundUrl(cfg, path) {
   return base + "/" + path;
 }
 
-// Messaging.svc SOAP-style JSON (this is what worked in PowerShell)
+// Messaging.svc – JSON with Messages[], Sender, Basic Auth + X-API-Key
 async function sendMessagingCommand(tenantId, imei, text) {
   const cfg = getTenantConfig(tenantId);
   const url = buildInboundUrl(cfg, "/Messaging.svc/Message");
 
+  const auth = Buffer.from(`${cfg.username}:${cfg.password}`).toString(
+    "base64"
+  );
+
+  const headers = {
+    Authorization: `Basic ${auth}`,
+    "X-API-Key": cfg.apiKey,
+    "Content-Type": "application/json",
+  };
+
   const payload = {
-    Username: cfg.username,
-    Password: cfg.password,
-    Message: {
-      Imei: String(imei),
-      Text: text,
-      SendToInbox: true,
-    },
+    Messages: [
+      {
+        Recipients: [Number(imei)],
+        Sender: "MAGNUS ECC", // MUST be non-empty => fixes "message sender is empty"
+        Timestamp: `/Date(${Date.now()})/`,
+        Message: text,
+      },
+    ],
   };
 
   console.log("[Messaging] POST", url, "payload:", payload);
 
   const res = await axios.post(url, payload, {
-    headers: { "Content-Type": "application/json" },
+    headers,
     timeout: 10000,
   });
 
@@ -385,7 +376,7 @@ async function sendMessagingCommand(tenantId, imei, text) {
   return res.data;
 }
 
-// Emergency.svc AcknowledgeDeclare
+// Emergency.svc AcknowledgeDeclare (Alternate SOS – Code 15 soft-handled)
 async function acknowledgeSos(tenantId, imei) {
   const cfg = getTenantConfig(tenantId);
   const url = buildInboundUrl(
@@ -508,7 +499,7 @@ app.post(
   }
 );
 
-// ACK SOS (Code 15 => soft success)
+// ACK SOS (Code 15 => soft success / GEOS)
 app.post(
   "/api/garmin/devices/:imei/ack-sos",
   authenticateApiKey,
