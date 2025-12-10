@@ -471,8 +471,6 @@ app.post("/api/garmin/devices/:imei/message", authenticateApiKey, async (req, re
     });
   }
 });
-
-// ---- API: acknowledge SOS ----
 app.post(
   "/api/garmin/devices/:imei/ack-sos",
   authenticateApiKey,
@@ -483,8 +481,32 @@ app.post(
         return res.status(400).json({ error: "Missing IMEI" });
       }
 
-      const result = await acknowledgeSos(ACTIVE_TENANT_ID, imei);
+      let remoteResult = null;
+      try {
+        remoteResult = await acknowledgeSos(ACTIVE_TENANT_ID, imei);
+      } catch (err) {
+        const data = err.response?.data;
+        const code = data?.Code;
 
+        // If Garmin says "Illegal emergency action" (Code 15),
+        // it means GEOS is the SOS provider – treat as soft-success.
+        if (code === 15) {
+          console.warn(
+            "[ack-sos] Illegal emergency action (Code 15) – SOS handled by GEOS, not tenant.",
+            data
+          );
+          remoteResult = data; // keep for inspection
+        } else {
+          // real error – bubble up
+          console.error("[ack-sos] Error:", data || err.message);
+          return res.status(500).json({
+            error: "ACK SOS failed",
+            detail: data || err.message,
+          });
+        }
+      }
+
+      // Update local device regardless (we still want ECC timeline clean)
       const device = devicesStore.update(imei, (d) => {
         d.isActiveSos = false;
         d.lastSosAckAt = new Date().toISOString();
@@ -492,21 +514,27 @@ app.post(
         d.sosTimeline.push({
           type: "sos-ack",
           at: d.lastSosAckAt,
+          note: "Locally acknowledged; SOS provider is GEOS",
         });
       });
 
       global._wsBroadcast({ type: "sosUpdate", device });
 
-      return res.json({ ok: true, result });
+      return res.json({
+        ok: true,
+        provider: "GEOS",
+        remoteResult,
+      });
     } catch (err) {
-      console.error("[ack-sos] Error:", err.response?.data || err.message);
+      console.error("[ack-sos] Unexpected error:", err);
       return res.status(500).json({
         error: "ACK SOS failed",
-        detail: err.response?.data || err.message,
+        detail: err.message,
       });
     }
   }
 );
+
 
 // ---- OPTIONAL: stubs for locate / tracking (so UI doesn’t 404) ----
 app.post(
