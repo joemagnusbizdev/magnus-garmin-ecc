@@ -35,7 +35,9 @@ const TENANTS = {
       ),
       username: process.env.SATDESK22_INBOUND_USERNAME || "",
       password: process.env.SATDESK22_INBOUND_PASSWORD || "",
-      apiKey: process.env.SATDESK22_INBOUND_API_KEY || "", // used for X-API-Key
+      apiKey: process.env.SATDESK22_INBOUND_API_KEY || "",
+      // 👇 NEW – this must be a valid, Garmin-accepted address
+      senderEmail: process.env.SATDESK22_SENDER_EMAIL || "",
     },
   },
 };
