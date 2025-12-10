@@ -66,7 +66,27 @@ const corsOptions = {
 };
 
 
-app.options("*", cors(corsOptions)); // handle all preflights
+// CORS config
+const corsOptions = {
+  origin: function (origin, cb) {
+    const allowed = [
+      "https://blog.magnusafety.com",
+      "http://localhost:5500",
+      "http://127.0.0.1:5500"
+    ];
+    if (!origin || allowed.includes(origin)) return cb(null, true);
+    return cb(new Error("Not allowed by CORS"));
+  },
+  methods: ["GET", "POST", "OPTIONS"],
+  allowedHeaders: ["Content-Type", "x-api-key"],
+};
+
+// apply globally
+app.use(cors(corsOptions));
+
+// handle preflight only for API routes (✅ Express 5 friendly)
+app.options("/api/*", cors(corsOptions));
+
 
 app.use(bodyParser.json());
 
