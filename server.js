@@ -28,7 +28,7 @@ const TENANTS = {
       username: process.env.SATDESK22_INBOUND_USERNAME || "",
       password: process.env.SATDESK22_INBOUND_PASSWORD || "",
       apiKey: process.env.SATDESK22_INBOUND_API_KEY || "",
-      // 👇 MUST be a valid, Garmin-accepted sender (email/SMS)
+      // MUST be a valid, Garmin-accepted sender (email/SMS)
       senderEmail: process.env.SATDESK22_SENDER_EMAIL || "",
     },
   },
@@ -37,7 +37,6 @@ const TENANTS = {
 // -------------------- APP + CORS --------------------
 const app = express();
 
-// simple explicit CORS allow-list for now
 const corsOptions = {
   origin: function (origin, cb) {
     const allowed = [
@@ -100,6 +99,7 @@ wss.on("connection", (ws) => {
 // -------------------- DEVICE STORE --------------------
 class DevicesStore {
   constructor() {
+    /** @type {Record<string, any>} */
     this.devices = {};
   }
 
@@ -116,18 +116,28 @@ class DevicesStore {
       this.devices[imei] = {
         imei,
         label: imei,
+        status: "open",
         messages: [],
         sosTimeline: [],
+        positions: [],
         isActiveSos: false,
+        trackingEnabled: false,
+        trackingInterval: null,
+        lastPositionAt: null,
+        lastMessageAt: null,
+        lastEventAt: null,
         lastSosEventAt: null,
         lastSosAckAt: null,
+        lastSosCancelAt: null,
+        lastSosAddress: null,
+        lastAddresses: [],
+        statusRaw: {},
       };
     }
     fn(this.devices[imei]);
     return this.devices[imei];
   }
 
-  // === SOS FIX: inbound messages marked as SOS when SOS is active ===
   addInboundMessageFromEvent(evt) {
     const imei = evt.imei || evt.Imei;
     if (!imei) return;
@@ -136,88 +146,83 @@ class DevicesStore {
     const text = evt.freeText || evt.message || evt.Message || "";
 
     this.update(imei, (d) => {
-      const isSos = !!d.isActiveSos; // if SOS currently active, treat as SOS message
-
       if (!Array.isArray(d.messages)) d.messages = [];
       d.messages.push({
         id: "in-" + Date.now(),
         direction: "inbound",
         text,
         timestamp: tsIso,
-        is_sos: isSos,
+        is_sos: false,
       });
       d.lastMessageAt = tsIso;
-
-      if (!Array.isArray(d.sosTimeline)) d.sosTimeline = [];
-
-      if (isSos) {
-        d.sosTimeline.push({
-          type: "sos-inbound-message",
-          at: tsIso,
-          text,
-        });
-      } else {
-        d.sosTimeline.push({
-          type: "inbound-message",
-          at: tsIso,
-          text,
-        });
-      }
     });
   }
 
-  // === Outbound messages; if SOS, also log in sosTimeline ===
   addOutboundMessage(imei, { text, is_sos }) {
     const tsIso = new Date().toISOString();
     this.update(imei, (d) => {
-      const isSos = !!is_sos;
-
       if (!Array.isArray(d.messages)) d.messages = [];
       d.messages.push({
         id: "out-" + Date.now(),
         direction: "outbound",
         text,
         timestamp: tsIso,
-        is_sos: isSos,
+        is_sos: !!is_sos,
       });
       d.lastMessageAt = tsIso;
-
-      if (!Array.isArray(d.sosTimeline)) d.sosTimeline = [];
-      if (isSos) {
-        d.sosTimeline.push({
-          type: "sos-outbound-message",
-          at: tsIso,
-          text,
-        });
-      }
     });
   }
 
-  // Core Garmin IPC Event ingestion
   ingestEvent(evt) {
     const imei = evt.imei || evt.Imei;
     if (!imei) return;
 
-    const tsIso = new Date().toISOString();
+    const tsIso = evt.timeStamp
+      ? new Date(evt.timeStamp).toISOString()
+      : new Date().toISOString();
     const code = evt.messageCode;
     const msgCode = Number(code);
     const text = evt.freeText || evt.message || "";
     const point = evt.point || evt.Point || null;
+    const addresses = evt.addresses || evt.Addresses || [];
+    const status = evt.status || evt.Status || {};
 
     const dev = this.update(imei, (d) => {
       d.lastEventAt = tsIso;
 
+      // Position handling – matches front-end (position + positions[])
       if (point && point.latitude != null && point.longitude != null) {
-        d.point = {
-          latitude: point.latitude,
-          longitude: point.longitude,
+        const pos = {
+          lat: point.latitude,
+          lng: point.longitude,
           altitude: point.altitude,
           gpsFix: point.gpsFix ?? point.gps_fix ?? null,
           course: point.course,
           speed: point.speed,
           timestamp: tsIso,
         };
+        d.position = pos;
+        if (!Array.isArray(d.positions)) d.positions = [];
+        d.positions.push(pos);
+        if (d.positions.length > 500) {
+          d.positions = d.positions.slice(-500);
+        }
         d.lastPositionAt = tsIso;
+      }
+
+      d.statusRaw = status || {};
+      d.lastAddresses = addresses || [];
+
+      // Remember last SOS address for replies
+      const firstAddress = addresses && addresses[0];
+      const addrValue =
+        firstAddress &&
+        (firstAddress.address ||
+          firstAddress.Address ||
+          firstAddress.value ||
+          firstAddress);
+      if (addrValue && (msgCode === 4 || msgCode === 6 || msgCode === 3)) {
+        d.lastSosAddress = addrValue;
       }
 
       if (!Array.isArray(d.sosTimeline)) d.sosTimeline = [];
@@ -233,15 +238,30 @@ class DevicesStore {
         });
         break;
 
-      case 2: // Free Text (one variant)
-      case 3: // Free Text (the one we see in logs)
+      case 1: // Device Status (e.g., low battery)
+        dev.sosTimeline.push({
+          type: "status",
+          code: msgCode,
+          at: tsIso,
+          status: dev.statusRaw,
+        });
+        break;
+
+      case 2: // Free Text
       case 3099: // Canned / QuickText
+      case 3: // Inbound text w/ SOS context (Messenger, etc.)
         this.addInboundMessageFromEvent(evt);
+        dev.sosTimeline.push({
+          type: "inbound-message",
+          code: msgCode,
+          at: tsIso,
+          text,
+        });
         break;
 
       case 4: // Declare SOS
         dev.isActiveSos = true;
-        dev.lastSosEventAt = tsIso; // only DECLARE sets the "event time"
+        dev.lastSosEventAt = tsIso;
         dev.sosTimeline.push({
           type: "sos-declare",
           code: msgCode,
@@ -250,11 +270,11 @@ class DevicesStore {
         });
         break;
 
-      case 6: // SOS-related event / confirm
-        // Keep SOS active, but DO NOT bump lastSosEventAt (so ack stays valid)
+      case 6: // Confirm SOS
         dev.isActiveSos = true;
+        dev.lastSosEventAt = tsIso;
         dev.sosTimeline.push({
-          type: "sos-confirm-or-update",
+          type: "sos-confirm",
           code: msgCode,
           at: tsIso,
           text,
@@ -282,6 +302,7 @@ class DevicesStore {
         break;
 
       case 10: // Start Track
+        dev.trackingEnabled = true;
         dev.sosTimeline.push({
           type: "track-start",
           code: msgCode,
@@ -298,6 +319,7 @@ class DevicesStore {
         break;
 
       case 12: // Stop Track
+        dev.trackingEnabled = false;
         dev.sosTimeline.push({
           type: "track-stop",
           code: msgCode,
@@ -350,7 +372,7 @@ function buildInboundUrl(cfg, path) {
 }
 
 // Messaging.svc – Messages[], Sender MUST be valid email/SMS
-async function sendMessagingCommand(tenantId, imei, text) {
+async function sendMessagingCommand(tenantId, imei, text, recipientOverride) {
   const cfg = getTenantConfig(tenantId);
   const url = buildInboundUrl(cfg, "/Messaging.svc/Message");
 
@@ -374,10 +396,15 @@ async function sendMessagingCommand(tenantId, imei, text) {
     );
   }
 
+  const recipient =
+    recipientOverride != null
+      ? Number(recipientOverride)
+      : Number(imei);
+
   const payload = {
     Messages: [
       {
-        Recipients: [Number(imei)],
+        Recipients: [recipient],
         Sender: sender,
         Timestamp: `/Date(${Date.now()})/`,
         Message: text,
@@ -452,6 +479,52 @@ app.get("/api/garmin/devices/:imei", authenticateApiKey, (req, res) => {
   res.json(dev);
 });
 
+// Messages list (for chat panel)
+app.get(
+  "/api/garmin/devices/:imei/messages",
+  authenticateApiKey,
+  (req, res) => {
+    const imei = req.params.imei;
+    const limit = parseInt(req.query.limit, 10) || 50;
+    const dev = devicesStore.get(imei);
+    if (!dev || !Array.isArray(dev.messages)) {
+      return res.json([]);
+    }
+    const msgs = dev.messages.slice(-limit);
+    res.json(msgs);
+  }
+);
+
+// SOS state (for banner)
+app.get(
+  "/api/garmin/devices/:imei/sos/state",
+  authenticateApiKey,
+  (req, res) => {
+    const imei = req.params.imei;
+    const dev = devicesStore.get(imei);
+    if (!dev) return res.json(null);
+    res.json({
+      imei: dev.imei,
+      isActiveSos: !!dev.isActiveSos,
+      lastSosEventAt: dev.lastSosEventAt || null,
+      lastSosAckAt: dev.lastSosAckAt || null,
+      lastSosCancelAt: dev.lastSosCancelAt || null,
+    });
+  }
+);
+
+// Positions track (for map + locations tab)
+app.get(
+  "/api/garmin/devices/:imei/positions",
+  authenticateApiKey,
+  (req, res) => {
+    const imei = req.params.imei;
+    const dev = devicesStore.get(imei);
+    if (!dev || !Array.isArray(dev.positions)) return res.json([]);
+    res.json(dev.positions);
+  }
+);
+
 // IPC Outbound webhook from Garmin
 app.post("/garmin/ipc-outbound", (req, res) => {
   const token = req.headers["x-outbound-auth-token"];
@@ -494,30 +567,25 @@ app.post(
           .json({ error: "Missing IMEI or text for message" });
       }
 
-      const trimmedText = text.trim();
+      const trimmed = text.trim();
 
-      // === SOS FIX: auto-flag as SOS if device is in active SOS and caller didn't specify is_sos ===
-      const dev = devicesStore.get(imei);
-      const hasActiveSos = !!(dev && dev.isActiveSos);
-      const isSosFlag =
-        typeof is_sos === "boolean" ? !!is_sos : hasActiveSos;
-
-      // Optional: auto-prefix SOS text, purely cosmetic
-      const finalText =
-        isSosFlag && !trimmedText.toLowerCase().startsWith("sos:")
-          ? `SOS: ${trimmedText}`
-          : trimmedText;
-
-      // Store outbound in ECC history (including sosTimeline if SOS)
+      // Store outbound in ECC history
       devicesStore.addOutboundMessage(imei, {
-        text: finalText,
-        is_sos: isSosFlag,
+        text: trimmed,
+        is_sos: !!is_sos,
       });
+
+      const devBefore = devicesStore.get(imei);
+      const recipientOverride =
+        is_sos && devBefore && devBefore.lastSosAddress != null
+          ? devBefore.lastSosAddress
+          : null;
 
       const result = await sendMessagingCommand(
         ACTIVE_TENANT_ID,
         imei,
-        finalText
+        trimmed,
+        recipientOverride
       );
 
       const device = devicesStore.get(imei);
@@ -570,24 +638,14 @@ app.post(
         }
       }
 
-      // === SOS FIX: mark ACK time, do NOT cancel SOS here ===
-      const ackIso = new Date().toISOString();
       const device = devicesStore.update(imei, (d) => {
-        d.lastSosAckAt = ackIso;
+        d.isActiveSos = false;
+        d.lastSosAckAt = new Date().toISOString();
         if (!Array.isArray(d.sosTimeline)) d.sosTimeline = [];
         d.sosTimeline.push({
           type: "sos-ack",
-          at: ackIso,
+          at: d.lastSosAckAt,
           note: "Locally acknowledged; SOS provider may be GEOS",
-        });
-
-        if (!Array.isArray(d.messages)) d.messages = [];
-        d.messages.push({
-          id: "sos-ack-" + Date.now(),
-          direction: "system",
-          text: `SOS acknowledged by MAGNUS ECC at ${ackIso}`,
-          timestamp: ackIso,
-          is_sos: true,
         });
       });
 
@@ -602,6 +660,83 @@ app.post(
       console.error("[ack-sos] Unexpected error:", err);
       res.status(500).json({ error: "ACK SOS failed", detail: err.message });
     }
+  }
+);
+
+// ----- Stub command endpoints used by the front-end -----
+
+// Request locate (stub – no real Garmin command yet)
+app.post(
+  "/api/garmin/devices/:imei/locate",
+  authenticateApiKey,
+  (req, res) => {
+    const imei = req.params.imei;
+    const tsIso = new Date().toISOString();
+    const dev = devicesStore.update(imei, (d) => {
+      if (!Array.isArray(d.sosTimeline)) d.sosTimeline = [];
+      d.sosTimeline.push({
+        type: "locate-request",
+        at: tsIso,
+      });
+    });
+    global._wsBroadcast({ type: "deviceUpdate", device: dev });
+    res.json({ ok: true, note: "Locate stub; no Garmin command sent." });
+  }
+);
+
+// Tracking start
+app.post(
+  "/api/garmin/devices/:imei/tracking/start",
+  authenticateApiKey,
+  (req, res) => {
+    const imei = req.params.imei;
+    const tsIso = new Date().toISOString();
+    const dev = devicesStore.update(imei, (d) => {
+      d.trackingEnabled = true;
+      if (!Array.isArray(d.sosTimeline)) d.sosTimeline = [];
+      d.sosTimeline.push({
+        type: "tracking-start-manual",
+        at: tsIso,
+      });
+    });
+    global._wsBroadcast({ type: "deviceUpdate", device: dev });
+    res.json({ ok: true });
+  }
+);
+
+// Tracking stop
+app.post(
+  "/api/garmin/devices/:imei/tracking/stop",
+  authenticateApiKey,
+  (req, res) => {
+    const imei = req.params.imei;
+    const tsIso = new Date().toISOString();
+    const dev = devicesStore.update(imei, (d) => {
+      d.trackingEnabled = false;
+      if (!Array.isArray(d.sosTimeline)) d.sosTimeline = [];
+      d.sosTimeline.push({
+        type: "tracking-stop-manual",
+        at: tsIso,
+      });
+    });
+    global._wsBroadcast({ type: "deviceUpdate", device: dev });
+    res.json({ ok: true });
+  }
+);
+
+// Close incident
+app.post(
+  "/api/garmin/devices/:imei/close",
+  authenticateApiKey,
+  (req, res) => {
+    const imei = req.params.imei;
+    const tsIso = new Date().toISOString();
+    const dev = devicesStore.update(imei, (d) => {
+      d.status = "closed";
+      d.closedAt = tsIso;
+    });
+    global._wsBroadcast({ type: "deviceUpdate", device: dev });
+    res.json({ ok: true });
   }
 );
 
