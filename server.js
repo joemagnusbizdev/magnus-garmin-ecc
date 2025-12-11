@@ -119,12 +119,15 @@ class DevicesStore {
         messages: [],
         sosTimeline: [],
         isActiveSos: false,
+        lastSosEventAt: null,
+        lastSosAckAt: null,
       };
     }
     fn(this.devices[imei]);
     return this.devices[imei];
   }
 
+  // === SOS FIX: inbound messages marked as SOS when SOS is active ===
   addInboundMessageFromEvent(evt) {
     const imei = evt.imei || evt.Imei;
     if (!imei) return;
@@ -133,33 +136,64 @@ class DevicesStore {
     const text = evt.freeText || evt.message || evt.Message || "";
 
     this.update(imei, (d) => {
+      const isSos = !!d.isActiveSos; // if SOS currently active, treat as SOS message
+
       if (!Array.isArray(d.messages)) d.messages = [];
       d.messages.push({
         id: "in-" + Date.now(),
         direction: "inbound",
         text,
         timestamp: tsIso,
-        is_sos: false,
+        is_sos: isSos,
       });
       d.lastMessageAt = tsIso;
+
+      if (!Array.isArray(d.sosTimeline)) d.sosTimeline = [];
+
+      if (isSos) {
+        d.sosTimeline.push({
+          type: "sos-inbound-message",
+          at: tsIso,
+          text,
+        });
+      } else {
+        d.sosTimeline.push({
+          type: "inbound-message",
+          at: tsIso,
+          text,
+        });
+      }
     });
   }
 
+  // === Outbound messages; if SOS, also log in sosTimeline ===
   addOutboundMessage(imei, { text, is_sos }) {
     const tsIso = new Date().toISOString();
     this.update(imei, (d) => {
+      const isSos = !!is_sos;
+
       if (!Array.isArray(d.messages)) d.messages = [];
       d.messages.push({
         id: "out-" + Date.now(),
         direction: "outbound",
         text,
         timestamp: tsIso,
-        is_sos: !!is_sos,
+        is_sos: isSos,
       });
       d.lastMessageAt = tsIso;
+
+      if (!Array.isArray(d.sosTimeline)) d.sosTimeline = [];
+      if (isSos) {
+        d.sosTimeline.push({
+          type: "sos-outbound-message",
+          at: tsIso,
+          text,
+        });
+      }
     });
   }
 
+  // Core Garmin IPC Event ingestion
   ingestEvent(evt) {
     const imei = evt.imei || evt.Imei;
     if (!imei) return;
@@ -199,20 +233,15 @@ class DevicesStore {
         });
         break;
 
-      case 2: // Free Text
+      case 2: // Free Text (one variant)
+      case 3: // Free Text (the one we see in logs)
       case 3099: // Canned / QuickText
         this.addInboundMessageFromEvent(evt);
-        dev.sosTimeline.push({
-          type: "inbound-message",
-          code: msgCode,
-          at: tsIso,
-          text,
-        });
         break;
 
       case 4: // Declare SOS
         dev.isActiveSos = true;
-        dev.lastSosEventAt = tsIso;
+        dev.lastSosEventAt = tsIso; // only DECLARE sets the "event time"
         dev.sosTimeline.push({
           type: "sos-declare",
           code: msgCode,
@@ -221,11 +250,11 @@ class DevicesStore {
         });
         break;
 
-      case 6: // Confirm SOS
+      case 6: // SOS-related event / confirm
+        // Keep SOS active, but DO NOT bump lastSosEventAt (so ack stays valid)
         dev.isActiveSos = true;
-        dev.lastSosEventAt = tsIso;
         dev.sosTimeline.push({
-          type: "sos-confirm",
+          type: "sos-confirm-or-update",
           code: msgCode,
           at: tsIso,
           text,
@@ -465,16 +494,30 @@ app.post(
           .json({ error: "Missing IMEI or text for message" });
       }
 
-      // Store outbound in ECC history
+      const trimmedText = text.trim();
+
+      // === SOS FIX: auto-flag as SOS if device is in active SOS and caller didn't specify is_sos ===
+      const dev = devicesStore.get(imei);
+      const hasActiveSos = !!(dev && dev.isActiveSos);
+      const isSosFlag =
+        typeof is_sos === "boolean" ? !!is_sos : hasActiveSos;
+
+      // Optional: auto-prefix SOS text, purely cosmetic
+      const finalText =
+        isSosFlag && !trimmedText.toLowerCase().startsWith("sos:")
+          ? `SOS: ${trimmedText}`
+          : trimmedText;
+
+      // Store outbound in ECC history (including sosTimeline if SOS)
       devicesStore.addOutboundMessage(imei, {
-        text: text.trim(),
-        is_sos: !!is_sos,
+        text: finalText,
+        is_sos: isSosFlag,
       });
 
       const result = await sendMessagingCommand(
         ACTIVE_TENANT_ID,
         imei,
-        text.trim()
+        finalText
       );
 
       const device = devicesStore.get(imei);
@@ -527,14 +570,24 @@ app.post(
         }
       }
 
+      // === SOS FIX: mark ACK time, do NOT cancel SOS here ===
+      const ackIso = new Date().toISOString();
       const device = devicesStore.update(imei, (d) => {
-        d.isActiveSos = false;
-        d.lastSosAckAt = new Date().toISOString();
+        d.lastSosAckAt = ackIso;
         if (!Array.isArray(d.sosTimeline)) d.sosTimeline = [];
         d.sosTimeline.push({
           type: "sos-ack",
-          at: d.lastSosAckAt,
+          at: ackIso,
           note: "Locally acknowledged; SOS provider may be GEOS",
+        });
+
+        if (!Array.isArray(d.messages)) d.messages = [];
+        d.messages.push({
+          id: "sos-ack-" + Date.now(),
+          direction: "system",
+          text: `SOS acknowledged by MAGNUS ECC at ${ackIso}`,
+          timestamp: ackIso,
+          is_sos: true,
         });
       });
 
