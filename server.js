@@ -371,8 +371,7 @@ function buildInboundUrl(cfg, path) {
   return base + "/" + path;
 }
 
-// Messaging.svc – Messages[], Sender MUST be valid email/SMS
-async function sendMessagingCommand(tenantId, imei, text, recipientOverride) {
+async function sendMessagingCommand(tenantId, imei, text) {
   const cfg = getTenantConfig(tenantId);
   const url = buildInboundUrl(cfg, "/Messaging.svc/Message");
 
@@ -396,15 +395,13 @@ async function sendMessagingCommand(tenantId, imei, text, recipientOverride) {
     );
   }
 
-  const recipient =
-    recipientOverride != null
-      ? Number(recipientOverride)
-      : Number(imei);
+  // 🔍 extra logging + send IMEI as string (IPC supports string int64)
+  const recipient = String(imei).trim();
 
   const payload = {
     Messages: [
       {
-        Recipients: [recipient],
+        Recipients: [recipient],          // 👈 string IMEI
         Sender: sender,
         Timestamp: `/Date(${Date.now()})/`,
         Message: text,
@@ -412,7 +409,10 @@ async function sendMessagingCommand(tenantId, imei, text, recipientOverride) {
     ],
   };
 
-  console.log("[Messaging] POST", url, "payload:", payload);
+  console.log("[Messaging] POST", url);
+  console.log("[Messaging] Recipients:", payload.Messages[0].Recipients);
+  console.log("[Messaging] Sender:", sender);
+  console.log("[Messaging] Text:", text);
 
   const res = await axios.post(url, payload, {
     headers,
@@ -427,7 +427,6 @@ async function sendMessagingCommand(tenantId, imei, text, recipientOverride) {
 
   return res.data;
 }
-
 // Emergency.svc AcknowledgeDeclare
 async function acknowledgeSos(tenantId, imei) {
   const cfg = getTenantConfig(tenantId);
